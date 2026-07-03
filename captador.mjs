@@ -60,6 +60,26 @@ function safeRead(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return
   console.log(`creds: wasender=${CFG.TOKEN ? 'ok' : 'FALTA'} ml=${CFG.ML_COOKIE ? 'ok(' + CFG.ML_TAG + ')' : 'off'}`);
 })();
 
+// ---------- rotas (multi-grupo): roteia por JID de ORIGEM ----------
+// Cada rota: de qual grupo pegar (source) -> pra qual mandar (target) usando qual token/tag/mercado.
+// BR: Amazon + Mercado Livre. US: so Amazon (amazon.com). O numero que RECEBE e o que ENVIA podem ser
+// sessoes/tokens diferentes do Wasender (ex.: US recebe por um numero e posta por outro).
+const ROUTES = [
+  { market: 'BR', source: CFG.SOURCE, target: CFG.TARGET, token: CFG.TOKEN, amzTag: CFG.AMZ_TAG, ml: true },
+];
+if (process.env.SOURCE_GROUP_JID_US && process.env.WASENDER_TOKEN_US) {
+  ROUTES.push({
+    market: 'US',
+    source: process.env.SOURCE_GROUP_JID_US,
+    target: process.env.TARGET_GROUP_JID_US || '',
+    token: process.env.WASENDER_TOKEN_US,
+    amzTag: process.env.AMAZON_TAG_US || 'rogeriocoloco-20',
+    ml: false,
+  });
+}
+const routeFor = (jid) => ROUTES.find(r => r.source === jid) || null;
+console.log('rotas:', ROUTES.map(r => `${r.market}[${r.source} -> ${r.target} tag=${r.amzTag} ml=${r.ml} tok=${r.token ? 'ok' : 'FALTA'}]`).join('  |  '));
+
 // ---------- dedup persistente ----------
 const DATA = path.join(ROOT, 'data'); fs.mkdirSync(DATA, { recursive: true });
 const DEDUP = path.join(DATA, 'enviados.json');
@@ -104,11 +124,13 @@ async function validImg(url) {
 }
 
 // ---------- resolvers ----------
-async function resolveAmazon(url) {
+async function resolveAmazon(url, route) {
+  const tld = route.market === 'US' ? 'com' : 'com.br';
+  const lang = route.market === 'US' ? 'en-US,en;q=0.9' : 'pt-BR,pt;q=0.9';
   // passo 1: ASIN seguindo o redirect com UA normal (a URL final tem /dp/ASIN mesmo se a pagina vier como captcha)
   let canon = url, html1 = '';
   try {
-    const r = await fetchT(url, { headers: { 'User-Agent': CFG.UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html' }, redirect: 'follow' });
+    const r = await fetchT(url, { headers: { 'User-Agent': CFG.UA, 'Accept-Language': lang, Accept: 'text/html' }, redirect: 'follow' });
     canon = r.url; html1 = await r.text();
   } catch (e) { log('  amazon p1', String(e).slice(0, 80)); }
   const asin = pick(canon + '\n' + html1, /\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/, /"asin"\s*:\s*"([A-Z0-9]{10})"/i);
@@ -117,16 +139,16 @@ async function resolveAmazon(url) {
   let image = '', title = '', price = '';
   for (let i = 0; i < 3 && !image; i++) {
     try {
-      const { html } = await getHtml(`https://www.amazon.com.br/dp/${asin}`);
+      const { html } = await getHtml(`https://www.amazon.${tld}/dp/${asin}`);
       if (!title) title = pick(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i).replace(/\s*[:|-]\s*Amazon.*$/i, '');
-      if (!price) price = pick(html, /class="a-offscreen">\s*(R\$[\s\d.,]+)/i);
+      if (!price) price = pick(html, /class="a-offscreen">\s*([R$][\s\d.,]*\d)/i); // R$ (BR) ou $ (US)
       const og = pick(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i, /"hiRes"\s*:\s*"(https:[^"]+)"/i, /data-old-hires=["'](https:[^"']+)/i);
       if (og && await validImg(og)) image = og;
     } catch (e) { log('  amazon p2', String(e).slice(0, 80)); }
   }
   // fallback: imagem por ASIN, so se for valida (o endpoint devolve gif 43b de placeholder p/ alguns ASIN)
   if (!image) { const det = `https://images-na.ssl-images-amazon.com/images/P/${asin}.jpg`; if (await validImg(det)) image = det; }
-  return { productId: asin, link: `https://www.amazon.com.br/dp/${asin}?tag=${CFG.AMZ_TAG}`, image, title, price, network: 'amazon' };
+  return { productId: asin, link: `https://www.amazon.${tld}/dp/${asin}?tag=${route.amzTag}`, image, title, price, network: 'amazon' };
 }
 
 // chama o createLink oficial do ML; devolve o short link meli.la (com nossa tag)
@@ -175,20 +197,29 @@ async function resolveML(url) {
 
 // ---------- montar copy (nao copia literal o autor -> anti-espelho) ----------
 const HEADERS = ['🔥 ACHADO', '💥 OFERTA', '🍌 PREÇO DE BANANA', '⚡ PROMO', '🚨 BAIXOU'];
-function buildText(o, cupom) {
-  const L = [`${HEADERS[rand(0, HEADERS.length)]}${o.title ? ' — ' + o.title : ''}`];
+const HEADERS_US = ['🔥 HOT DEAL', '💥 PRICE DROP', '⚡ DEAL ALERT', '🚨 PRICE DROP', '📉 DEAL'];
+function buildText(o, cupom, route) {
+  const us = route.market === 'US';
+  const H = us ? HEADERS_US : HEADERS;
+  const L = [`${H[rand(0, H.length)]}${o.title ? ' — ' + o.title : ''}`];
   if (o.price) L.push(`💰 ${o.price}`);
   L.push('', `👉 ${o.link}`);
-  if (cupom) L.push('', `🎟️ Cupom: *${cupom}*`);
+  if (cupom) L.push('', us ? `🎟️ Coupon: *${cupom}*` : `🎟️ Cupom: *${cupom}*`);
   return L.join('\n');
 }
 
-async function sendOffer(o, cupom) {
-  const payload = { to: CFG.TARGET, text: buildText(o, cupom) };
-  if (o.image) payload.imageUrl = o.image;
-  const r = await fetch(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + CFG.TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(payload) });
+// envia usando o token/destino DA ROTA (US recebe por um numero e posta por outro -> token diferente)
+async function wasend(route, payload) {
+  const r = await fetchT(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + route.token, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ to: route.target, ...payload }) }, 15000);
   const t = await r.text();
-  log('  send', r.status, t.slice(0, 160));
+  return { ok: r.ok, status: r.status, body: t.slice(0, 160) };
+}
+
+async function sendOffer(o, cupom, route) {
+  const payload = { text: buildText(o, cupom, route) };
+  if (o.image) payload.imageUrl = o.image;
+  const r = await wasend(route, payload);
+  log(`  send ${route.market}`, r.status, r.body);
   return r.ok;
 }
 
@@ -209,25 +240,25 @@ async function followToAmazon(start) {
   return /amazon\./i.test(url) ? url : null;
 }
 // reescreve a URL final da Amazon com a NOSSA tag (mantem /dp/ASIN ou pagina de promo tipo /primeday; dropa tracking deles)
-function amazonRetag(u) { try { const x = new URL(u); return x.origin + x.pathname + '?tag=' + CFG.AMZ_TAG; } catch { return null; } }
+function amazonRetag(u, route) { try { const x = new URL(u); return x.origin + x.pathname + '?tag=' + route.amzTag; } catch { return null; } }
 // converte o link de resgate do concorrente (tabuga.do/amzn.to/...) na Amazon com a nossa tag
-async function resolveResgate(rawUrl) {
+async function resolveResgate(rawUrl, route) {
   if (!rawUrl) return null;
   const amz = await followToAmazon(rawUrl);
-  return amz ? amazonRetag(amz) : null;
+  return amz ? amazonRetag(amz, route) : null;
 }
 
 // cupom-sem-produto: reposta o codigo + regras com link proprio (dropa link/imagem da origem)
-async function sendCoupon(item) {
-  const L = [`🎟️ CUPOM AMAZON${item.cupom ? ' — *' + item.cupom + '*' : ''}`];
+async function sendCoupon(item, route) {
+  const us = route.market === 'US';
+  const L = [`🎟️ ${us ? 'AMAZON COUPON' : 'CUPOM AMAZON'}${item.cupom ? ' — *' + item.cupom + '*' : ''}`];
   if (item.rules) L.push(item.rules);
   let link = null;
-  if (item.resgate) { try { link = await resolveResgate(item.resgate); } catch (e) { log('  resgate erro', String(e).slice(0, 80)); } }
-  L.push('', `👉 ${link || 'https://www.amazon.com.br?tag=' + CFG.AMZ_TAG}`);
-  const payload = { to: CFG.TARGET, text: L.join('\n') };
-  const r = await fetch(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + CFG.TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(payload) });
-  const t = await r.text();
-  log('  send cupom', r.status, t.slice(0, 160));
+  if (item.resgate) { try { link = await resolveResgate(item.resgate, route); } catch (e) { log('  resgate erro', String(e).slice(0, 80)); } }
+  const home = `https://www.amazon.${us ? 'com' : 'com.br'}?tag=${route.amzTag}`;
+  L.push('', `👉 ${link || home}`);
+  const r = await wasend(route, { text: L.join('\n') });
+  log(`  send cupom ${route.market}`, r.status, r.body);
   return r.ok;
 }
 
@@ -235,16 +266,15 @@ async function sendCoupon(item) {
 function cleanStatus(text) {
   return (text || '').replace(/https?:\/\/[^\s]+/g, ' ').replace(/tabugado[^\s]*/gi, ' ').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 220);
 }
-async function sendStatus(text) {
-  const payload = { to: CFG.TARGET, text };
-  const r = await fetchT(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + CFG.TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(payload) }, 15000);
-  log('  send status', r.status, (await r.text()).slice(0, 120));
+async function sendStatus(text, route) {
+  const r = await wasend(route, { text });
+  log(`  send status ${route.market}`, r.status, r.body);
   return r.ok;
 }
 
-async function resolve(url) {
-  if (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(url)) return resolveAmazon(url);
-  if (/mercadoliv|mercadolibre|meli\.la|\/sec\//i.test(url)) return resolveML(url);
+async function resolve(url, route) {
+  if (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(url)) return resolveAmazon(url, route);
+  if (route.ml && /mercadoliv|mercadolibre|meli\.la|\/sec\//i.test(url)) return resolveML(url);
   return null;
 }
 
@@ -268,23 +298,26 @@ async function worker() {
   while (queue.length) {
     const item = queue[0]; // PEEK: so remove da fila (disco) depois de enviar OK -> sobrevive a restart/crash sem perder
     let remove = true;
+    // rota da mensagem (por JID de origem). Legado: itens antigos sem src caem na rota BR (a primeira).
+    const route = routeFor(item.src) || ROUTES.find(r => r.market === 'BR') || ROUTES[0];
     try {
-      if (item.kind === 'status') {
-        await sendStatus(item.text); // status e informativo: best-effort, sem retry
+      if (!route || !route.token || !route.target) { log('  SEM rota/token/destino -> descarta', item.src || item.url || ''); }
+      else if (item.kind === 'status') {
+        await sendStatus(item.text, route); // status e informativo: best-effort, sem retry
       } else if (item.kind === 'coupon') {
         const id = 'cupom:' + item.cupom;
         if (sent.has(id)) log('  dup cupom', item.cupom);
-        else if (await sendCoupon(item)) remember(id);
+        else if (await sendCoupon(item, route)) remember(id);
         else remove = keepForRetry(item, 'envio de cupom falhou');
       } else {
-        const o = await resolve(item.url);
+        const o = await resolve(item.url, route);
         if (!o) remove = keepForRetry(item, 'nao resolveu (bloqueio/link morto)');
         else if (!o.link) remove = keepForRetry(item, 'sem link de afiliado (cookie ML?)');
         else if (sent.has(o.productId)) log('  dup, ja enviado', o.productId);
         else {
-          if (item.srcPrice) o.price = item.srcPrice; // preco da origem (ex.: PIX) tem prioridade
+          if (item.srcPrice) o.price = item.srcPrice; // preco da origem (ex.: PIX/US$) tem prioridade
           if (!o.title && item.srcTitle) o.title = item.srcTitle; // titulo da origem se a Amazon nao devolve og:title
-          if (await sendOffer(o, item.cupom)) remember(o.productId);
+          if (await sendOffer(o, item.cupom, route)) remember(o.productId);
           else remove = keepForRetry(item, 'envio da oferta falhou');
         }
       }
@@ -350,7 +383,8 @@ function handle(body) {
   const { jid, fromMe, text, msgId } = parseMessage(body);
   log('  rx', 'evento=' + (body?.event || body?.type || '?'), 'jid=' + (jid || '-'), 'txt=' + text.slice(0, 45).replace(/\n/g, ' '));
   if (fromMe) return { skip: 'fromMe' };
-  if (CFG.SOURCE && jid && jid !== CFG.SOURCE) return { skip: `outro grupo (${jid})` };
+  const route = routeFor(jid); // roteia pela ORIGEM: BR (Amazon+ML) ou US (so Amazon)
+  if (!route) return { skip: `grupo nao mapeado (${jid})` };
   // o Wasender dispara ~3 eventos por mensagem (upsert + received + group.received) -> processa so 1x
   if (msgId && seenMsg.has(msgId)) return { skip: 'evento duplicado' };
   if (msgId) { seenMsg.add(msgId); if (seenMsg.size > 3000) seenMsg.clear(); }
@@ -358,22 +392,28 @@ function handle(body) {
   if (!offers.length) {
     // aviso de status de cupom (esgotado/expirou/acabou) -> reposta pro grupo saber
     if (/cupom/i.test(text) && /esgotad|acabou|acabaram|expirou|encerrad|finaliz|indispon|fora do ar|desativ|cupom\s+off/i.test(text)) {
-      queue.push({ kind: 'status', text: cleanStatus(text) });
+      queue.push({ kind: 'status', text: cleanStatus(text), src: jid });
       saveQueue(); worker();
       return { enfileiradas: 1, tipo: 'status' };
     }
     if (CFG.COUPON_REPOST && cupom) {
       const resgate = (text.match(/https?:\/\/[^\s]+/i) || [])[0] || '';
-      queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text), resgate });
+      queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text), resgate, src: jid });
       saveQueue(); worker();
       return { enfileiradas: 1, tipo: 'cupom' };
     }
     return { skip: 'sem ofertas' };
   }
   // preco da origem so vale quando ha 1 oferta (1 preco = 1 produto); multi-oferta usa preco real por item
-  const price = offers.length === 1 ? srcPrice : '';
-  const title = offers.length === 1 ? srcTitle : '';
-  for (const url of offers) queue.push({ url, cupom, srcPrice: price, srcTitle: title });
+  const single = offers.length === 1;
+  let price = single ? srcPrice : '';
+  let title = single ? srcTitle : '';
+  if (route.market === 'US') { // US manda em USD/ingles: pega "Now: $X" e deixa o titulo vir do og:title real da amazon.com
+    const m = text.match(/now[:\s~]*\$?\s*([\d,]+\.\d{2})/i) || text.match(/\$\s*([\d,]+\.\d{2})/);
+    price = single && m ? '$' + m[1] : '';
+    title = '';
+  }
+  for (const url of offers) queue.push({ url, cupom, srcPrice: price, srcTitle: title, src: jid });
   saveQueue(); worker();
   return { enfileiradas: offers.length };
 }
