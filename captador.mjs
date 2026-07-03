@@ -192,11 +192,38 @@ async function sendOffer(o, cupom) {
   return r.ok;
 }
 
+// segue redirects HTTP + meta-refresh ate a Amazon (encurtadores do concorrente: tabuga.do -> amzn.to -> amazon)
+async function followToAmazon(start) {
+  let url = start;
+  for (let i = 0; i < 8; i++) {
+    if (/amazon\./i.test(url)) return url; // ja chegou na amazon: nao carrega a pagina (1MB)
+    let r;
+    try { r = await fetchT(url, { redirect: 'manual', headers: { 'User-Agent': CFG.UA, Accept: 'text/html', 'Accept-Language': 'pt-BR' } }, 8000); } catch { return null; }
+    const loc = r.headers.get('location');
+    if (loc && r.status >= 300 && r.status < 400) { url = loc.startsWith('http') ? loc : new URL(loc, url).href; continue; }
+    let b = ''; try { b = await r.text(); } catch {}
+    const mr = (b.match(/http-equiv=["']refresh["'][^>]*url=([^"'>\s]+)/i) || [, ''])[1];
+    if (mr) { url = mr.startsWith('http') ? mr : new URL(mr, url).href; continue; }
+    break;
+  }
+  return /amazon\./i.test(url) ? url : null;
+}
+// reescreve a URL final da Amazon com a NOSSA tag (mantem /dp/ASIN ou pagina de promo tipo /primeday; dropa tracking deles)
+function amazonRetag(u) { try { const x = new URL(u); return x.origin + x.pathname + '?tag=' + CFG.AMZ_TAG; } catch { return null; } }
+// converte o link de resgate do concorrente (tabuga.do/amzn.to/...) na Amazon com a nossa tag
+async function resolveResgate(rawUrl) {
+  if (!rawUrl) return null;
+  const amz = await followToAmazon(rawUrl);
+  return amz ? amazonRetag(amz) : null;
+}
+
 // cupom-sem-produto: reposta o codigo + regras com link proprio (dropa link/imagem da origem)
 async function sendCoupon(item) {
   const L = [`🎟️ CUPOM AMAZON${item.cupom ? ' — *' + item.cupom + '*' : ''}`];
   if (item.rules) L.push(item.rules);
-  L.push('', `👉 https://www.amazon.com.br?tag=${CFG.AMZ_TAG}`);
+  let link = null;
+  if (item.resgate) { try { link = await resolveResgate(item.resgate); } catch (e) { log('  resgate erro', String(e).slice(0, 80)); } }
+  L.push('', `👉 ${link || 'https://www.amazon.com.br?tag=' + CFG.AMZ_TAG}`);
   const payload = { to: CFG.TARGET, text: L.join('\n') };
   const r = await fetch(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + CFG.TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(payload) });
   const t = await r.text();
@@ -320,13 +347,14 @@ function handle(body) {
   const { offers, cupom, srcPrice, srcTitle } = extractOffers(text);
   if (!offers.length) {
     // aviso de status de cupom (esgotado/expirou/acabou) -> reposta pro grupo saber
-    if (/cupom/i.test(text) && /esgotad|acabou|acabaram|expirou|encerrad|finaliz|indispon|fora do ar|off\b/i.test(text)) {
+    if (/cupom/i.test(text) && /esgotad|acabou|acabaram|expirou|encerrad|finaliz|indispon|fora do ar|desativ|cupom\s+off/i.test(text)) {
       queue.push({ kind: 'status', text: cleanStatus(text) });
       saveQueue(); worker();
       return { enfileiradas: 1, tipo: 'status' };
     }
     if (CFG.COUPON_REPOST && cupom) {
-      queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text) });
+      const resgate = (text.match(/https?:\/\/[^\s]+/i) || [])[0] || '';
+      queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text), resgate });
       saveQueue(); worker();
       return { enfileiradas: 1, tipo: 'cupom' };
     }
