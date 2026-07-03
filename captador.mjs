@@ -24,6 +24,7 @@ const CFG = {
   SOURCE: process.env.SOURCE_GROUP_JID  || '5521985322034-1542837195@g.us', // TÁ BUGADO
   TARGET: process.env.TARGET_GROUP_JID  || '120363423312940352@g.us',       // Preço de Banana
   AMZ_TAG: process.env.AMAZON_TAG || 'bananadeals-20',
+  COUPON_REPOST: process.env.COUPON_REPOST === '1', // repostar cupons-sem-produto com link proprio (padrao: off)
   ML_COOKIE: process.env.ML_COOKIE || '',
   ML_TAG:    process.env.ML_TAG || '',
   MIN_DELAY: (+process.env.MIN_DELAY_S || 30) * 1000,   // jitter minimo entre envios
@@ -130,6 +131,18 @@ async function sendOffer(o, cupom) {
   return r.ok;
 }
 
+// cupom-sem-produto: reposta o codigo + regras com link proprio (dropa link/imagem da origem)
+async function sendCoupon(item) {
+  const L = [`🎟️ CUPOM AMAZON${item.cupom ? ' — *' + item.cupom + '*' : ''}`];
+  if (item.rules) L.push(item.rules);
+  L.push('', `👉 https://www.amazon.com.br?tag=${CFG.AMZ_TAG}`);
+  const payload = { to: CFG.TARGET, text: L.join('\n') };
+  const r = await fetch(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + CFG.TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(payload) });
+  const t = await r.text();
+  log('  send cupom', r.status, t.slice(0, 160));
+  return r.ok;
+}
+
 async function resolve(url) {
   if (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(url)) return resolveAmazon(url);
   if (/mercadoliv|mercadolibre|\/sec\//i.test(url)) return resolveML(url);
@@ -141,7 +154,17 @@ const queue = []; let working = false;
 async function worker() {
   if (working) return; working = true;
   while (queue.length) {
-    const { url, cupom, srcPrice } = queue.shift();
+    const item = queue.shift();
+    if (item.kind === 'coupon') {
+      const id = 'cupom:' + item.cupom;
+      try {
+        if (sent.has(id)) log('  dup cupom', item.cupom);
+        else if (await sendCoupon(item)) remember(id);
+      } catch (e) { log('  erro cupom', String(e).slice(0, 160)); }
+      if (queue.length) await sleep(Math.max(6000, rand(CFG.MIN_DELAY, CFG.MAX_DELAY)));
+      continue;
+    }
+    const { url, cupom, srcPrice } = item;
     try {
       const o = await resolve(url);
       if (!o) { log('  ignorado (rede desconhecida)', url); continue; }
@@ -170,9 +193,19 @@ function parseMessage(body) {
 function extractOffers(text) {
   const urls = [...new Set((text.match(/https?:\/\/[^\s)]+/gi) || []))];
   const offers = urls.filter(u => /amzn\.to|amazon\.|\.amazon\/|a\.co\/|mercadoliv|mercadolibre|\/sec\//i.test(u));
-  const cupom = (text.match(/cupom[:\s]+([A-Z0-9]{4,})/i) || [,''])[1];
+  // exige ":" (formato real "CUPOM: CODIGO"); fallback sem ":" ignora "CUPOM AMAZON/MERCADO" (titulos)
+  const cupom = (text.match(/cupom\s*[:\-]\s*([A-Z0-9]{4,})/i)
+              || text.match(/cupom\s+(?!amazon|amzn|mercado|prime)([A-Z0-9]{4,})/i)
+              || [, ''])[1];
   const srcPrice = (text.match(/R\$\s?\d{1,3}(?:\.\d{3})*,\d{2}/) || [''])[0];
   return { offers, cupom, srcPrice };
+}
+
+// regras do cupom (ex.: "10% OFF acima de R$300", "Limitado a R$100"), sem URLs/lixo da origem
+function extractCouponRules(text) {
+  return text.split('\n').map(l => l.trim())
+    .filter(l => l && /%|R\$|acima|limit/i.test(l) && !/https?:|tabuga|resgate|usar\s+cupom/i.test(l))
+    .slice(0, 3).join('\n');
 }
 
 function handle(body) {
@@ -180,7 +213,14 @@ function handle(body) {
   if (fromMe) return { skip: 'fromMe' };
   if (CFG.SOURCE && jid && jid !== CFG.SOURCE) return { skip: `outro grupo (${jid})` };
   const { offers, cupom, srcPrice } = extractOffers(text);
-  if (!offers.length) return { skip: 'sem ofertas' };
+  if (!offers.length) {
+    if (CFG.COUPON_REPOST && cupom) {
+      queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text) });
+      worker();
+      return { enfileiradas: 1, tipo: 'cupom' };
+    }
+    return { skip: 'sem ofertas' };
+  }
   // preco da origem so vale quando ha 1 oferta (1 preco = 1 produto); multi-oferta usa preco real por item
   const price = offers.length === 1 ? srcPrice : '';
   for (const url of offers) queue.push({ url, cupom, srcPrice: price });
