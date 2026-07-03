@@ -66,6 +66,10 @@ const DEDUP = path.join(DATA, 'enviados.json');
 const sent = new Set(fs.existsSync(DEDUP) ? JSON.parse(fs.readFileSync(DEDUP, 'utf8')) : []);
 const remember = (id) => { sent.add(id); fs.writeFileSync(DEDUP, JSON.stringify([...sent], null, 0)); };
 
+// ---------- fila persistente (sobrevive a restart -> nao perde oferta em espera) ----------
+const QUEUE_FILE = path.join(DATA, 'fila.json');
+const saveQueue = () => { try { fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 0)); } catch (e) { console.error('saveQueue', e.message); } };
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (a, b) => Math.floor(Math.random() * (b - a) + a);
@@ -198,12 +202,14 @@ async function resolve(url) {
 }
 
 // ---------- fila global (respeita 1 msg/5s do Wasender + jitter anti-espelho) ----------
-const queue = []; let working = false;
+const queue = (() => { try { return fs.existsSync(QUEUE_FILE) ? JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8')) : []; } catch { return []; } })();
+let working = false;
 const seenMsg = new Set(); // dedup por id de mensagem (Wasender manda ~3 eventos por msg)
 async function worker() {
   if (working) return; working = true;
   while (queue.length) {
     const item = queue.shift();
+    saveQueue();
     if (item.kind === 'status') {
       try { await sendStatus(item.text); } catch (e) { log('  erro status', String(e).slice(0, 160)); }
       if (queue.length) await sleep(Math.max(6000, rand(CFG.MIN_DELAY, CFG.MAX_DELAY)));
@@ -296,12 +302,12 @@ function handle(body) {
     // aviso de status de cupom (esgotado/expirou/acabou) -> reposta pro grupo saber
     if (/cupom/i.test(text) && /esgotad|acabou|acabaram|expirou|encerrad|finaliz|indispon|fora do ar|off\b/i.test(text)) {
       queue.push({ kind: 'status', text: cleanStatus(text) });
-      worker();
+      saveQueue(); worker();
       return { enfileiradas: 1, tipo: 'status' };
     }
     if (CFG.COUPON_REPOST && cupom) {
       queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text) });
-      worker();
+      saveQueue(); worker();
       return { enfileiradas: 1, tipo: 'cupom' };
     }
     return { skip: 'sem ofertas' };
@@ -310,7 +316,7 @@ function handle(body) {
   const price = offers.length === 1 ? srcPrice : '';
   const title = offers.length === 1 ? srcTitle : '';
   for (const url of offers) queue.push({ url, cupom, srcPrice: price, srcTitle: title });
-  worker();
+  saveQueue(); worker();
   return { enfileiradas: offers.length };
 }
 
@@ -335,4 +341,7 @@ http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, ...out }));
     });
   } else { log('req', req.method, req.url); res.writeHead(200); res.end('captador up'); }
-}).listen(CFG.PORT, () => log(`captador on :${CFG.PORT}  source=${CFG.SOURCE}  target=${CFG.TARGET}  tag=${CFG.AMZ_TAG}`));
+}).listen(CFG.PORT, () => {
+  log(`captador on :${CFG.PORT}  source=${CFG.SOURCE}  target=${CFG.TARGET}  tag=${CFG.AMZ_TAG}`);
+  if (queue.length) { log(`retomando fila persistida: ${queue.length} item(ns)`); worker(); } // sobrevive a restart
+});
