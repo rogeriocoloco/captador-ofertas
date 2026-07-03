@@ -179,11 +179,12 @@ async function worker() {
       if (queue.length) await sleep(Math.max(6000, rand(CFG.MIN_DELAY, CFG.MAX_DELAY)));
       continue;
     }
-    const { url, cupom, srcPrice } = item;
+    const { url, cupom, srcPrice, srcTitle } = item;
     try {
       const o = await resolve(url);
       if (!o) { log('  ignorado (rede desconhecida)', url); continue; }
       if (srcPrice) o.price = srcPrice; // preco anunciado na origem (ex.: valor via PIX) tem prioridade
+      if (!o.title && srcTitle) o.title = srcTitle; // titulo da origem quando a Amazon nao devolve og:title
       if (!o.link) { log('  SEM link de afiliado (ML sem cookie?) -> pula', o.productId); continue; }
       if (sent.has(o.productId)) { log('  dup, ja enviado', o.productId); continue; }
       const ok = await sendOffer(o, cupom);
@@ -213,7 +214,21 @@ function extractOffers(text) {
               || text.match(/cupom\s+(?!amazon|amzn|mercado|prime)([A-Z0-9]{4,})/i)
               || [, ''])[1];
   const srcPrice = (text.match(/R\$\s?\d{1,3}(?:\.\d{3})*,\d{2}/) || [''])[0];
-  return { offers, cupom, srcPrice };
+  return { offers, cupom, srcPrice, srcTitle: extractTitle(text) };
+}
+
+// nome do produto a partir do texto da oferta (fallback quando a Amazon nao devolve og:title)
+function extractTitle(text) {
+  const t = (text || '')
+    .replace(/https?:\/\/[^\s]+/g, ' ')                      // remove URLs
+    .replace(/R\$[\s\S]*$/i, ' ')                            // corta do preco em diante
+    .replace(/EXCLUSIVO PARA ASSINANTES PRIME|IMPORTA[ÇC][AÃ]O AMAZON!*|IMPOSTOS J[ÁA] INCLU[ÍI]DOS!*|O DESCONTO APARECE NA TELA DE FINALIZA[ÇC][AÃ]O|NOVO CUPOM AMAZON!*|PAGANDO VIA PIX|VIA PIX/gi, ' ')
+    .replace(/TOP\b/g, ' ')
+    .replace(/[^\p{L}\p{N}\s,.\-ºª°²³/()"+]/gu, ' ')          // tira emojis/simbolos, mantem pontuacao util
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s\-•!.:,]+|[\s\-•!.:,]+$/g, '')
+    .trim();
+  return t.length > 3 ? t.slice(0, 90) : '';
 }
 
 // regras do cupom (ex.: "10% OFF acima de R$300", "Limitado a R$100"), sem URLs/lixo da origem
@@ -228,7 +243,7 @@ function handle(body) {
   log('  rx', 'evento=' + (body?.event || body?.type || '?'), 'jid=' + (jid || '-'), 'txt=' + text.slice(0, 45).replace(/\n/g, ' '));
   if (fromMe) return { skip: 'fromMe' };
   if (CFG.SOURCE && jid && jid !== CFG.SOURCE) return { skip: `outro grupo (${jid})` };
-  const { offers, cupom, srcPrice } = extractOffers(text);
+  const { offers, cupom, srcPrice, srcTitle } = extractOffers(text);
   if (!offers.length) {
     if (CFG.COUPON_REPOST && cupom) {
       queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text) });
@@ -239,7 +254,8 @@ function handle(body) {
   }
   // preco da origem so vale quando ha 1 oferta (1 preco = 1 produto); multi-oferta usa preco real por item
   const price = offers.length === 1 ? srcPrice : '';
-  for (const url of offers) queue.push({ url, cupom, srcPrice: price });
+  const title = offers.length === 1 ? srcTitle : '';
+  for (const url of offers) queue.push({ url, cupom, srcPrice: price, srcTitle: title });
   worker();
   return { enfileiradas: offers.length };
 }
