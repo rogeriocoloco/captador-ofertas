@@ -141,10 +141,11 @@ const queue = []; let working = false;
 async function worker() {
   if (working) return; working = true;
   while (queue.length) {
-    const { url, cupom } = queue.shift();
+    const { url, cupom, srcPrice } = queue.shift();
     try {
       const o = await resolve(url);
       if (!o) { log('  ignorado (rede desconhecida)', url); continue; }
+      if (srcPrice) o.price = srcPrice; // preco anunciado na origem (ex.: valor via PIX) tem prioridade
       if (!o.link) { log('  SEM link de afiliado (ML sem cookie?) -> pula', o.productId); continue; }
       if (sent.has(o.productId)) { log('  dup, ja enviado', o.productId); continue; }
       const ok = await sendOffer(o, cupom);
@@ -170,16 +171,19 @@ function extractOffers(text) {
   const urls = [...new Set((text.match(/https?:\/\/[^\s)]+/gi) || []))];
   const offers = urls.filter(u => /amzn\.to|amazon\.|\.amazon\/|a\.co\/|mercadoliv|mercadolibre|\/sec\//i.test(u));
   const cupom = (text.match(/cupom[:\s]+([A-Z0-9]{4,})/i) || [,''])[1];
-  return { offers, cupom };
+  const srcPrice = (text.match(/R\$\s?\d{1,3}(?:\.\d{3})*,\d{2}/) || [''])[0];
+  return { offers, cupom, srcPrice };
 }
 
 function handle(body) {
   const { jid, fromMe, text } = parseMessage(body);
   if (fromMe) return { skip: 'fromMe' };
   if (CFG.SOURCE && jid && jid !== CFG.SOURCE) return { skip: `outro grupo (${jid})` };
-  const { offers, cupom } = extractOffers(text);
+  const { offers, cupom, srcPrice } = extractOffers(text);
   if (!offers.length) return { skip: 'sem ofertas' };
-  for (const url of offers) queue.push({ url, cupom });
+  // preco da origem so vale quando ha 1 oferta (1 preco = 1 produto); multi-oferta usa preco real por item
+  const price = offers.length === 1 ? srcPrice : '';
+  for (const url of offers) queue.push({ url, cupom, srcPrice: price });
   worker();
   return { enfileiradas: offers.length };
 }
