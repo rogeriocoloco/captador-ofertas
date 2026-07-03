@@ -91,6 +91,12 @@ const QUEUE_FILE = path.join(DATA, 'fila.json');
 const saveQueue = () => { try { fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 0)); } catch (e) { console.error('saveQueue', e.message); } };
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// ---------- historico em memoria (visibilidade via GET /status) ----------
+const BOOT = Date.now();
+const rxLog = [];   // ultimas mensagens RECEBIDAS + decisao
+const txLog = [];   // ultimos envios feitos pro grupo
+const ringPush = (arr, item) => { arr.push({ t: new Date().toISOString(), ...item }); if (arr.length > 60) arr.shift(); };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (a, b) => Math.floor(Math.random() * (b - a) + a);
 
@@ -212,6 +218,7 @@ function buildText(o, cupom, route) {
 async function wasend(route, payload) {
   const r = await fetchT(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + route.token, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ to: route.target, ...payload }) }, 15000);
   const t = await r.text();
+  ringPush(txLog, { market: route.market, to: route.target, ok: r.ok, status: r.status, txt: (payload.text || payload.imageUrl || '').slice(0, 90) });
   return { ok: r.ok, status: r.status, body: t.slice(0, 160) };
 }
 
@@ -434,10 +441,15 @@ http.createServer((req, res) => {
   if (req.method === 'POST') {
     let b = ''; req.on('data', c => b += c);
     req.on('end', () => {
-      let out; try { out = handle(JSON.parse(b || '{}')); } catch (e) { out = { erro: String(e) }; }
+      let out, body;
+      try { body = JSON.parse(b || '{}'); out = handle(body); } catch (e) { out = { erro: String(e) }; }
+      try { const p = parseMessage(body || {}); if (p && p.jid) ringPush(rxLog, { jid: p.jid, market: (routeFor(p.jid) || {}).market || '?', txt: (p.text || '').slice(0, 120), out }); } catch {}
       log('webhook', req.url, JSON.stringify(out));
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, ...out }));
     });
+  } else if ((req.url || '').startsWith('/status')) {
+    const body = { up: true, uptime_s: Math.round((Date.now() - BOOT) / 1000), fila: queue.length, ja_enviados: sent.size, rotas: ROUTES.map(r => ({ market: r.market, source: r.source, target: r.target })), recebidas: rxLog.slice(-40).reverse(), enviadas: txLog.slice(-40).reverse() };
+    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body, null, 2));
   } else { log('req', req.method, req.url); res.writeHead(200); res.end('captador up'); }
 }).listen(CFG.PORT, () => {
   log(`captador on :${CFG.PORT}  source=${CFG.SOURCE}  target=${CFG.TARGET}  tag=${CFG.AMZ_TAG}`);
