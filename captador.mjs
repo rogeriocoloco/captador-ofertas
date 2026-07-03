@@ -131,7 +131,7 @@ async function sendOffer(o, cupom) {
 }
 
 async function resolve(url) {
-  if (/amzn\.to|amazon\./i.test(url)) return resolveAmazon(url);
+  if (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(url)) return resolveAmazon(url);
   if (/mercadoliv|mercadolibre|\/sec\//i.test(url)) return resolveML(url);
   return null;
 }
@@ -168,7 +168,7 @@ function parseMessage(body) {
 
 function extractOffers(text) {
   const urls = [...new Set((text.match(/https?:\/\/[^\s)]+/gi) || []))];
-  const offers = urls.filter(u => /amzn\.to|amazon\.|mercadoliv|mercadolibre|\/sec\//i.test(u));
+  const offers = urls.filter(u => /amzn\.to|amazon\.|\.amazon\/|a\.co\/|mercadoliv|mercadolibre|\/sec\//i.test(u));
   const cupom = (text.match(/cupom[:\s]+([A-Z0-9]{4,})/i) || [,''])[1];
   return { offers, cupom };
 }
