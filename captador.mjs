@@ -240,12 +240,13 @@ if (process.argv.includes('--test')) {
 
 // ---------- servidor ----------
 http.createServer((req, res) => {
-  if (req.method === 'POST' && req.url.startsWith('/webhook/captador')) {
+  // aceita QUALQUER POST como webhook (robusto se o Wasender for configurado so com o dominio, sem /webhook/captador)
+  if (req.method === 'POST') {
     let b = ''; req.on('data', c => b += c);
     req.on('end', () => {
       let out; try { out = handle(JSON.parse(b || '{}')); } catch (e) { out = { erro: String(e) }; }
-      log('webhook', JSON.stringify(out));
+      log('webhook', req.url, JSON.stringify(out));
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, ...out }));
     });
-  } else { res.writeHead(200); res.end('captador up'); }
+  } else { log('req', req.method, req.url); res.writeHead(200); res.end('captador up'); }
 }).listen(CFG.PORT, () => log(`captador on :${CFG.PORT}  source=${CFG.SOURCE}  target=${CFG.TARGET}  tag=${CFG.AMZ_TAG}`));
