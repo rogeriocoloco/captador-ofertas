@@ -280,9 +280,32 @@ async function sendStatus(text, route) {
 }
 
 async function resolve(url, route) {
+  if (/divulgadorinteligente\.com/i.test(url)) return resolveDivulgador(url, route);
   if (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(url)) return resolveAmazon(url, route);
   if (route.ml && /mercadoliv|mercadolibre|meli\.la|\/sec\//i.test(url)) return resolveML(url);
   return null;
+}
+
+// divulgadorinteligente.com/<site>/p/<uuid> = wrapper Next.js do concorrente; o produto real
+// (Amazon/loja) vem estruturado no __NEXT_DATA__ (titulo/imagem/preco/link) — sem scrapear a Amazon.
+async function resolveDivulgador(url, route) {
+  let prod = null;
+  try {
+    const r = await fetchT(url, { headers: { 'User-Agent': CFG.UA, 'Accept-Language': 'en-US,en;q=0.9', Accept: 'text/html' } }, 12000);
+    const html = await r.text();
+    const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (nd) prod = JSON.parse(nd[1])?.props?.pageProps?.product || null;
+  } catch (e) { log('  divulgador erro', String(e).slice(0, 100)); return null; }
+  if (!prod || !prod.link) { log('  divulgador sem produto/link'); return null; }
+  // so Amazon tem afiliado ligado hoje; outros sellers (walmart/etc) sao ignorados de proposito
+  if (prod.seller && prod.seller !== 'amazon') { log('  divulgador seller nao suportado:', prod.seller); return null; }
+  const amz = await followToAmazon(prod.link); // amzn.to/... ou amazon.com/... -> URL final da Amazon
+  if (!amz) { log('  divulgador link nao caiu na amazon:', prod.link); return null; }
+  const asin = (amz.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/) || [, ''])[1];
+  const tld = route.market === 'US' ? 'com' : 'com.br';
+  const link = asin ? `https://www.amazon.${tld}/dp/${asin}?tag=${route.amzTag}` : amazonRetag(amz, route);
+  // preco/titulo/imagem vem do concorrente (estruturado e confiavel) -> keepPrice trava override do worker
+  return { productId: asin || prod.uuid, link, image: prod.image || '', title: prod.title || '', price: prod.price || '', network: 'amazon', keepPrice: true };
 }
 
 // ---------- fila global (respeita 1 msg/5s do Wasender + jitter anti-espelho) ----------
@@ -322,7 +345,7 @@ async function worker() {
         else if (!o.link) remove = keepForRetry(item, 'sem link de afiliado (cookie ML?)');
         else if (sent.has(o.productId)) log('  dup, ja enviado', o.productId);
         else {
-          if (item.srcPrice) o.price = item.srcPrice; // preco da origem (ex.: PIX/US$) tem prioridade
+          if (item.srcPrice && !o.keepPrice) o.price = item.srcPrice; // preco da origem tem prioridade, salvo quando o resolver ja trouxe preco estruturado (divulgador)
           if (!o.title && item.srcTitle) o.title = item.srcTitle; // titulo da origem se a Amazon nao devolve og:title
           if (await sendOffer(o, item.cupom, route)) remember(o.productId);
           else remove = keepForRetry(item, 'envio da oferta falhou');
@@ -350,7 +373,7 @@ function parseMessage(body) {
 
 function extractOffers(text) {
   const urls = [...new Set((text.match(/https?:\/\/[^\s)]+/gi) || []))];
-  const offers = urls.filter(u => /amzn\.to|amazon\.|\.amazon\/|a\.co\/|mercadoliv|mercadolibre|meli\.la|\/sec\//i.test(u));
+  const offers = urls.filter(u => /amzn\.to|amazon\.|\.amazon\/|a\.co\/|mercadoliv|mercadolibre|meli\.la|\/sec\/|divulgadorinteligente\.com/i.test(u));
   // exige ":" (formato real "CUPOM: CODIGO"); fallback sem ":" ignora "CUPOM AMAZON/MERCADO" (titulos)
   const cupom = (text.match(/cupom\s*[:\-]\s*([A-Z0-9]{4,})/i)
               || text.match(/cupom\s+(?!amazon|amzn|mercado|prime)([A-Z0-9]{4,})/i)
