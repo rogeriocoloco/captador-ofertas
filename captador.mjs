@@ -70,11 +70,19 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (a, b) => Math.floor(Math.random() * (b - a) + a);
 
+// fetch com timeout (evita conexao travada segurar a fila)
+async function fetchT(url, opts = {}, ms = 8000) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), ms);
+  try { return await fetch(url, { ...opts, signal: ac.signal }); }
+  finally { clearTimeout(t); }
+}
+
 async function getHtml(url, cookie) {
   // UA de crawler: Amazon bloqueia IP de datacenter no browser normal, mas serve og:image/title pro crawler de preview
   const headers = { 'User-Agent': CFG.SCRAPE_UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html' };
   if (cookie) headers.Cookie = cookie; // cookie ML fura o challenge de bot (pagina real -> pega og:image)
-  const r = await fetch(url, { headers, redirect: 'follow' });
+  const r = await fetchT(url, { headers, redirect: 'follow' });
   return { finalUrl: r.url, html: await r.text() };
 }
 
@@ -83,7 +91,7 @@ function pick(html, ...res) { for (const re of res) { const m = html.match(re); 
 // valida que a URL e uma imagem real (evita mandar placeholder/quadro preto no WhatsApp)
 async function validImg(url) {
   try {
-    const r = await fetch(url);
+    const r = await fetchT(url, {}, 6000);
     if (!r.ok) return false;
     if (!/image\//i.test(r.headers.get('content-type') || '')) return false;
     const len = +(r.headers.get('content-length') || 0) || (await r.arrayBuffer()).byteLength;
@@ -96,7 +104,7 @@ async function resolveAmazon(url) {
   // passo 1: ASIN seguindo o redirect com UA normal (a URL final tem /dp/ASIN mesmo se a pagina vier como captcha)
   let canon = url, html1 = '';
   try {
-    const r = await fetch(url, { headers: { 'User-Agent': CFG.UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html' }, redirect: 'follow' });
+    const r = await fetchT(url, { headers: { 'User-Agent': CFG.UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html' }, redirect: 'follow' });
     canon = r.url; html1 = await r.text();
   } catch (e) { log('  amazon p1', String(e).slice(0, 80)); }
   const asin = pick(canon + '\n' + html1, /\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/, /"asin"\s*:\s*"([A-Z0-9]{10})"/i);
@@ -172,6 +180,17 @@ async function sendCoupon(item) {
   return r.ok;
 }
 
+// aviso de status de cupom (ex.: "CUPOM X ESGOTADO") — reposta o texto limpo, sem link/imagem
+function cleanStatus(text) {
+  return (text || '').replace(/https?:\/\/[^\s]+/g, ' ').replace(/tabugado[^\s]*/gi, ' ').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 220);
+}
+async function sendStatus(text) {
+  const payload = { to: CFG.TARGET, text };
+  const r = await fetchT(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + CFG.TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(payload) }, 15000);
+  log('  send status', r.status, (await r.text()).slice(0, 120));
+  return r.ok;
+}
+
 async function resolve(url) {
   if (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(url)) return resolveAmazon(url);
   if (/mercadoliv|mercadolibre|\/sec\//i.test(url)) return resolveML(url);
@@ -185,6 +204,11 @@ async function worker() {
   if (working) return; working = true;
   while (queue.length) {
     const item = queue.shift();
+    if (item.kind === 'status') {
+      try { await sendStatus(item.text); } catch (e) { log('  erro status', String(e).slice(0, 160)); }
+      if (queue.length) await sleep(Math.max(6000, rand(CFG.MIN_DELAY, CFG.MAX_DELAY)));
+      continue;
+    }
     if (item.kind === 'coupon') {
       const id = 'cupom:' + item.cupom;
       try {
@@ -269,6 +293,12 @@ function handle(body) {
   if (msgId) { seenMsg.add(msgId); if (seenMsg.size > 3000) seenMsg.clear(); }
   const { offers, cupom, srcPrice, srcTitle } = extractOffers(text);
   if (!offers.length) {
+    // aviso de status de cupom (esgotado/expirou/acabou) -> reposta pro grupo saber
+    if (/cupom/i.test(text) && /esgotad|acabou|acabaram|expirou|encerrad|finaliz|indispon|fora do ar|off\b/i.test(text)) {
+      queue.push({ kind: 'status', text: cleanStatus(text) });
+      worker();
+      return { enfileiradas: 1, tipo: 'status' };
+    }
     if (CFG.COUPON_REPOST && cupom) {
       queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text) });
       worker();
