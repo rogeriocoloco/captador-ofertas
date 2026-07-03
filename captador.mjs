@@ -31,6 +31,8 @@ const CFG = {
   MAX_DELAY: (+process.env.MAX_DELAY_S || 180) * 1000,  // jitter maximo (anti-espelho)
   PORT: +process.env.PORT || 3000,
   UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  // UA de crawler p/ scraping: Amazon bloqueia IP de datacenter no browser normal, mas libera og:image/title pro crawler de preview
+  SCRAPE_UA: 'WhatsApp/2.23.20.0',
 };
 const SEND_URL = 'https://wasenderapi.com/api/send-message'; // SEM www (www = Cloudflare 1010)
 
@@ -69,7 +71,8 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (a, b) => Math.floor(Math.random() * (b - a) + a);
 
 async function getHtml(url, cookie) {
-  const headers = { 'User-Agent': CFG.UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html' };
+  // UA de crawler: Amazon bloqueia IP de datacenter no browser normal, mas serve og:image/title pro crawler de preview
+  const headers = { 'User-Agent': CFG.SCRAPE_UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html' };
   if (cookie) headers.Cookie = cookie; // cookie ML fura o challenge de bot (pagina real -> pega og:image)
   const r = await fetch(url, { headers, redirect: 'follow' });
   return { finalUrl: r.url, html: await r.text() };
