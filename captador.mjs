@@ -227,7 +227,7 @@ function extractOffers(text) {
   const cupom = (text.match(/cupom\s*[:\-]\s*([A-Z0-9]{4,})/i)
               || text.match(/cupom\s+(?!amazon|amzn|mercado|prime)([A-Z0-9]{4,})/i)
               || [, ''])[1];
-  const srcPrice = (text.match(/R\$\s?\d{1,3}(?:\.\d{3})*,\d{2}/) || [''])[0];
+  const srcPrice = extractPricePhrase(text);
   return { offers, cupom, srcPrice, srcTitle: extractTitle(text) };
 }
 
@@ -236,13 +236,19 @@ function extractTitle(text) {
   const t = (text || '')
     .replace(/https?:\/\/[^\s]+/g, ' ')                      // remove URLs
     .replace(/R\$[\s\S]*$/i, ' ')                            // corta do preco em diante
-    .replace(/EXCLUSIVO PARA ASSINANTES PRIME|IMPORTA[ÇC][AÃ]O AMAZON!*|IMPOSTOS J[ÁA] INCLU[ÍI]DOS!*|O DESCONTO APARECE NA TELA DE FINALIZA[ÇC][AÃ]O|NOVO CUPOM AMAZON!*|PAGANDO VIA PIX|VIA PIX/gi, ' ')
+    .replace(/EXCLUSIVO PARA ASSINANTES PRIME|IMPORTA[ÇC][AÃ]O AMAZON!*|IMPOSTOS J[ÁA] INCLU[ÍI]DOS!*|O DESCONTO APARECE NA TELA DE FINALIZA[ÇC][AÃ]O|NOVO CUPOM AMAZON!*|PAGANDO VIA PIX|VIA PIX|ACABA RAPID[O]+!*|CORRE!*|[ÚU]LTIMAS UNIDADES!*/gi, ' ')
     .replace(/TOP\b/g, ' ')
     .replace(/[^\p{L}\p{N}\s,.\-ºª°²³/()"+]/gu, ' ')          // tira emojis/simbolos, mantem pontuacao util
     .replace(/\s+/g, ' ')
     .replace(/^[\s\-•!.:,]+|[\s\-•!.:,]+$/g, '')
     .trim();
-  return t.length > 3 ? t.slice(0, 90) : '';
+  return t.length > 3 ? t.slice(0, 200) : '';                // descricao ampliada (specs uteis)
+}
+
+// bloco de preco da origem completo (ex.: "R$1924,00 PAGANDO VIA PIX OU R$2.299,00 EM 10X") — preserva PIX + parcelado
+function extractPricePhrase(text) {
+  const m = (text || '').match(/R\$[\s\S]*?(?=\s*(?:👉|USAR\s*CUPOM|CUPOM\b|C[ÓO]DIGO|RESGATE|https?:\/\/|$))/i);
+  return m ? m[0].replace(/\s+/g, ' ').trim().slice(0, 120) : '';
 }
 
 // regras do cupom (ex.: "10% OFF acima de R$300", "Limitado a R$100"), sem URLs/lixo da origem
