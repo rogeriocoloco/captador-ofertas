@@ -82,12 +82,24 @@ function pick(html, ...res) { for (const re of res) { const m = html.match(re); 
 
 // ---------- resolvers ----------
 async function resolveAmazon(url) {
-  const { finalUrl, html } = await getHtml(url);
-  const asin = pick(finalUrl + '\n' + html, /\/dp\/([A-Z0-9]{10})/, /"asin"\s*:\s*"([A-Z0-9]{10})"/i);
+  // passo 1: ASIN seguindo o redirect com UA normal (a URL final tem /dp/ASIN mesmo se a pagina vier como captcha)
+  let canon = url, html1 = '';
+  try {
+    const r = await fetch(url, { headers: { 'User-Agent': CFG.UA, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html' }, redirect: 'follow' });
+    canon = r.url; html1 = await r.text();
+  } catch (e) { log('  amazon p1', String(e).slice(0, 80)); }
+  const asin = pick(canon + '\n' + html1, /\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/, /"asin"\s*:\s*"([A-Z0-9]{10})"/i);
   if (!asin) return null;
-  const image = pick(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i, /"hiRes"\s*:\s*"(https:[^"]+)"/i, /data-old-hires=["'](https:[^"']+)/i);
-  const title = pick(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i, /<title>([^<]+)</i).replace(/\s*[:|-]\s*Amazon.*$/i, '');
-  const price = pick(html, /class="a-offscreen">\s*(R\$[\s\d.,]+)/i);
+  // passo 2: og:image/title/preco com UA de crawler na URL limpa (Amazon libera as tags pro preview de link)
+  let image = '', title = '', price = '';
+  try {
+    const { html } = await getHtml(`https://www.amazon.com.br/dp/${asin}`);
+    image = pick(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i, /"hiRes"\s*:\s*"(https:[^"]+)"/i, /data-old-hires=["'](https:[^"']+)/i);
+    title = pick(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i).replace(/\s*[:|-]\s*Amazon.*$/i, '');
+    price = pick(html, /class="a-offscreen">\s*(R\$[\s\d.,]+)/i);
+  } catch (e) { log('  amazon p2', String(e).slice(0, 80)); }
+  // fallback de imagem: endpoint publico de imagem por ASIN (cobre boa parte dos produtos quando og falha)
+  if (!image) image = `https://images-na.ssl-images-amazon.com/images/P/${asin}.jpg`;
   return { productId: asin, link: `https://www.amazon.com.br/dp/${asin}?tag=${CFG.AMZ_TAG}`, image, title, price, network: 'amazon' };
 }
 
@@ -213,6 +225,7 @@ function extractCouponRules(text) {
 
 function handle(body) {
   const { jid, fromMe, text } = parseMessage(body);
+  log('  rx', 'evento=' + (body?.event || body?.type || '?'), 'jid=' + (jid || '-'), 'txt=' + text.slice(0, 45).replace(/\n/g, ' '));
   if (fromMe) return { skip: 'fromMe' };
   if (CFG.SOURCE && jid && jid !== CFG.SOURCE) return { skip: `outro grupo (${jid})` };
   const { offers, cupom, srcPrice } = extractOffers(text);
