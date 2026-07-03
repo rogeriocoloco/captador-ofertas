@@ -129,28 +129,48 @@ async function resolveAmazon(url) {
   return { productId: asin, link: `https://www.amazon.com.br/dp/${asin}?tag=${CFG.AMZ_TAG}`, image, title, price, network: 'amazon' };
 }
 
+// chama o createLink oficial do ML; devolve o short link meli.la (com nossa tag)
+async function mlCreateLink(productUrl) {
+  try {
+    const r = await fetchT('https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink', {
+      method: 'POST',
+      headers: { Cookie: CFG.ML_COOKIE, Origin: 'https://www.mercadolivre.com.br', Referer: 'https://www.mercadolivre.com.br/afiliados/linkbuilder', 'User-Agent': CFG.UA, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ urls: [productUrl], tag: CFG.ML_TAG }),
+    }, 12000);
+    const j = await r.json().catch(() => ({}));
+    const u = j?.urls?.[0] || {};
+    if (u.message && /not allowed/i.test(u.message)) { log('  ML createLink recusou', u.message); return null; }
+    // short_link direto, ou extrai do texto ("Ou acesse o link: https://meli.la/xxx")
+    return u.short_link || u.shortUrl || (u.text && (u.text.match(/https:\/\/meli\.la\/\w+/) || [null])[0]) || j.shortUrl || null;
+  } catch (e) { log('  ML createLink erro', String(e).slice(0, 120)); return null; }
+}
+
 async function resolveML(url) {
+  // meli.la/xxx e /sec/ redirecionam pra pagina /social/<tag> (wrapper do afiliado).
+  // A pagina lista o produto DESTACADO (card-featured) + recomendacoes. Precisamos so do destacado.
   let finalUrl = url, html = '';
-  try { ({ finalUrl, html } = await getHtml(url, CFG.ML_COOKIE)); } catch (e) { log('  ML page block', String(e).slice(0, 80)); }
-  // usa a URL original (o createLink aceita crua); canonical so se a pagina veio de verdade
-  const canonical = pick(html, /rel=["']canonical["']\s+href=["']([^"']+)/i) || url;
-  const productId = (canonical.match(/(MLB-?\d+)/) || [,''])[1] || canonical;
+  try {
+    const r = await fetchT(url, { headers: { 'User-Agent': CFG.UA, Cookie: CFG.ML_COOKIE, 'Accept-Language': 'pt-BR,pt;q=0.9', Accept: 'text/html' }, redirect: 'follow' }, 12000);
+    finalUrl = r.url; html = (await r.text()).replace(/&amp;/g, '&');
+  } catch (e) { log('  ML page block', String(e).slice(0, 80)); }
+
+  // produto compartilhado = card marcado como /home/card-featured/element; pega o item_id real (listing do vendedor)
+  let itemId = '';
+  const feat = html.match(/https?:\/\/[^"'\s\\]*?\/p\/MLB\d+[^"'\s\\]*?c_id=\/home\/card-featured\/element/i);
+  if (feat) itemId = (feat[0].match(/item_id[:%]3?A?(MLB\d+)/i) || feat[0].match(/wid=(MLB\d+)/i) || feat[0].match(/\/p\/(MLB\d+)/i) || [, ''])[1];
+  // fallback: primeiro item_id do body, senao MLB da propria URL
+  if (!itemId) itemId = (html.match(/pdp_filters=item_id%3A(MLB\d+)/i) || html.match(/item_id[:%]3?A?(MLB\d+)/i) || (finalUrl + url).match(/(MLB-?\d+)/i) || [, ''])[1];
+  itemId = (itemId || '').replace('-', '');
+
   const image = pick(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i);
   const title = pick(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i, /<title>([^<]+)</i);
   const price = pick(html, /"price"\s*:\s*"?([\d.,]+)"?/i);
-  let link = null;
-  if (CFG.ML_COOKIE && CFG.ML_TAG) {
-    try {
-      const r = await fetch('https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink', {
-        method: 'POST',
-        headers: { Cookie: CFG.ML_COOKIE, Origin: 'https://www.mercadolivre.com.br', Referer: 'https://www.mercadolivre.com.br/afiliados/linkbuilder', 'User-Agent': CFG.UA, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls: [canonical], tag: CFG.ML_TAG }),
-      });
-      const j = await r.json().catch(() => ({}));
-      link = j.shortUrl || j.short_link || j?.data?.[0]?.short_link || j?.urls?.[0]?.shortUrl || null;
-    } catch (e) { log('ML createLink erro', String(e).slice(0, 120)); }
-  }
-  return { productId, link, image, title, price: price ? 'R$ ' + price : '', network: 'ml' };
+
+  if (!itemId || !CFG.ML_COOKIE || !CFG.ML_TAG) { log('  ML sem itemId/creds', itemId || '-'); return null; }
+  // createLink so aceita o listing do vendedor (produto.mercadolivre.com.br/MLB-<id>); /p/MLB (catalogo) e recusado
+  const link = await mlCreateLink('https://produto.mercadolivre.com.br/' + itemId.replace('MLB', 'MLB-'));
+  if (!link) return null;
+  return { productId: itemId, link, image, title, price: price ? 'R$ ' + price : '', network: 'ml' };
 }
 
 // ---------- montar copy (nao copia literal o autor -> anti-espelho) ----------
@@ -197,7 +217,7 @@ async function sendStatus(text) {
 
 async function resolve(url) {
   if (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(url)) return resolveAmazon(url);
-  if (/mercadoliv|mercadolibre|\/sec\//i.test(url)) return resolveML(url);
+  if (/mercadoliv|mercadolibre|meli\.la|\/sec\//i.test(url)) return resolveML(url);
   return null;
 }
 
@@ -253,7 +273,7 @@ function parseMessage(body) {
 
 function extractOffers(text) {
   const urls = [...new Set((text.match(/https?:\/\/[^\s)]+/gi) || []))];
-  const offers = urls.filter(u => /amzn\.to|amazon\.|\.amazon\/|a\.co\/|mercadoliv|mercadolibre|\/sec\//i.test(u));
+  const offers = urls.filter(u => /amzn\.to|amazon\.|\.amazon\/|a\.co\/|mercadoliv|mercadolibre|meli\.la|\/sec\//i.test(u));
   // exige ":" (formato real "CUPOM: CODIGO"); fallback sem ":" ignora "CUPOM AMAZON/MERCADO" (titulos)
   const cupom = (text.match(/cupom\s*[:\-]\s*([A-Z0-9]{4,})/i)
               || text.match(/cupom\s+(?!amazon|amzn|mercado|prime)([A-Z0-9]{4,})/i)
