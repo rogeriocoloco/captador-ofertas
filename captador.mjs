@@ -27,8 +27,8 @@ const CFG = {
   COUPON_REPOST: process.env.COUPON_REPOST === '1', // repostar cupons-sem-produto com link proprio (padrao: off)
   ML_COOKIE: process.env.ML_COOKIE || '',
   ML_TAG:    process.env.ML_TAG || '',
-  MIN_DELAY: (+process.env.MIN_DELAY_S || 30) * 1000,   // jitter minimo entre envios
-  MAX_DELAY: (+process.env.MAX_DELAY_S || 180) * 1000,  // jitter maximo (anti-espelho)
+  MIN_DELAY: (+process.env.MIN_DELAY_S || 8) * 1000,    // jitter minimo entre envios (>=6s p/ o limite 1msg/5s)
+  MAX_DELAY: (+process.env.MAX_DELAY_S || 25) * 1000,   // jitter maximo (rapido o bastante p/ nao acumular em rajada)
   PORT: +process.env.PORT || 3000,
   UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   // UA de crawler p/ scraping: Amazon bloqueia IP de datacenter no browser normal, mas libera og:image/title pro crawler de preview
@@ -180,6 +180,7 @@ async function resolve(url) {
 
 // ---------- fila global (respeita 1 msg/5s do Wasender + jitter anti-espelho) ----------
 const queue = []; let working = false;
+const seenMsg = new Set(); // dedup por id de mensagem (Wasender manda ~3 eventos por msg)
 async function worker() {
   if (working) return; working = true;
   while (queue.length) {
@@ -217,7 +218,7 @@ function parseMessage(body) {
   const fromMe = m?.key?.fromMe === true;
   const text = m?.message?.conversation || m?.message?.extendedTextMessage?.text || m?.message?.text?.body
     || m?.message?.imageMessage?.caption || m?.text || m?.body || '';
-  return { jid, fromMe, text };
+  return { jid, fromMe, text, msgId: m?.key?.id || m?.id || '' };
 }
 
 function extractOffers(text) {
@@ -259,10 +260,13 @@ function extractCouponRules(text) {
 }
 
 function handle(body) {
-  const { jid, fromMe, text } = parseMessage(body);
+  const { jid, fromMe, text, msgId } = parseMessage(body);
   log('  rx', 'evento=' + (body?.event || body?.type || '?'), 'jid=' + (jid || '-'), 'txt=' + text.slice(0, 45).replace(/\n/g, ' '));
   if (fromMe) return { skip: 'fromMe' };
   if (CFG.SOURCE && jid && jid !== CFG.SOURCE) return { skip: `outro grupo (${jid})` };
+  // o Wasender dispara ~3 eventos por mensagem (upsert + received + group.received) -> processa so 1x
+  if (msgId && seenMsg.has(msgId)) return { skip: 'evento duplicado' };
+  if (msgId) { seenMsg.add(msgId); if (seenMsg.size > 3000) seenMsg.clear(); }
   const { offers, cupom, srcPrice, srcTitle } = extractOffers(text);
   if (!offers.length) {
     if (CFG.COUPON_REPOST && cupom) {
