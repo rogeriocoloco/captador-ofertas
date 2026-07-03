@@ -252,37 +252,47 @@ async function resolve(url) {
 const queue = (() => { try { return fs.existsSync(QUEUE_FILE) ? JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8')) : []; } catch { return []; } })();
 let working = false;
 const seenMsg = new Set(); // dedup por id de mensagem (Wasender manda ~3 eventos por msg)
+// mantem o item pra nova tentativa (falha transitoria: bloqueio/captcha/rede). Move pro fim da fila
+// pra os outros passarem na frente; desiste (e remove) apos MAX_TRIES. Retorna true se deve remover agora.
+const MAX_TRIES = 4;
+function keepForRetry(item, why) {
+  item.tries = (item.tries || 0) + 1;
+  if (item.tries >= MAX_TRIES) { log(`  DESISTIU apos ${item.tries}x:`, why, item.url || item.cupom || ''); return true; }
+  log(`  retry ${item.tries}/${MAX_TRIES - 1}:`, why, item.url || item.cupom || '');
+  if (queue.length > 1) queue.push(queue.shift()); // manda pro fim; se for o unico, fica e re-tenta apos o sleep
+  return false;
+}
+
 async function worker() {
   if (working) return; working = true;
   while (queue.length) {
-    const item = queue.shift();
-    saveQueue();
-    if (item.kind === 'status') {
-      try { await sendStatus(item.text); } catch (e) { log('  erro status', String(e).slice(0, 160)); }
-      if (queue.length) await sleep(Math.max(6000, rand(CFG.MIN_DELAY, CFG.MAX_DELAY)));
-      continue;
-    }
-    if (item.kind === 'coupon') {
-      const id = 'cupom:' + item.cupom;
-      try {
+    const item = queue[0]; // PEEK: so remove da fila (disco) depois de enviar OK -> sobrevive a restart/crash sem perder
+    let remove = true;
+    try {
+      if (item.kind === 'status') {
+        await sendStatus(item.text); // status e informativo: best-effort, sem retry
+      } else if (item.kind === 'coupon') {
+        const id = 'cupom:' + item.cupom;
         if (sent.has(id)) log('  dup cupom', item.cupom);
         else if (await sendCoupon(item)) remember(id);
-      } catch (e) { log('  erro cupom', String(e).slice(0, 160)); }
-      if (queue.length) await sleep(Math.max(6000, rand(CFG.MIN_DELAY, CFG.MAX_DELAY)));
-      continue;
-    }
-    const { url, cupom, srcPrice, srcTitle } = item;
-    try {
-      const o = await resolve(url);
-      if (!o) { log('  ignorado (rede desconhecida)', url); continue; }
-      if (srcPrice) o.price = srcPrice; // preco anunciado na origem (ex.: valor via PIX) tem prioridade
-      if (!o.title && srcTitle) o.title = srcTitle; // titulo da origem quando a Amazon nao devolve og:title
-      if (!o.link) { log('  SEM link de afiliado (ML sem cookie?) -> pula', o.productId); continue; }
-      if (sent.has(o.productId)) { log('  dup, ja enviado', o.productId); continue; }
-      const ok = await sendOffer(o, cupom);
-      if (ok) remember(o.productId);
-    } catch (e) { log('  erro processando', url, String(e).slice(0, 160)); }
-    if (queue.length) await sleep(Math.max(6000, rand(CFG.MIN_DELAY, CFG.MAX_DELAY))); // >=6s garante o limite de 5s
+        else remove = keepForRetry(item, 'envio de cupom falhou');
+      } else {
+        const o = await resolve(item.url);
+        if (!o) remove = keepForRetry(item, 'nao resolveu (bloqueio/link morto)');
+        else if (!o.link) remove = keepForRetry(item, 'sem link de afiliado (cookie ML?)');
+        else if (sent.has(o.productId)) log('  dup, ja enviado', o.productId);
+        else {
+          if (item.srcPrice) o.price = item.srcPrice; // preco da origem (ex.: PIX) tem prioridade
+          if (!o.title && item.srcTitle) o.title = item.srcTitle; // titulo da origem se a Amazon nao devolve og:title
+          if (await sendOffer(o, item.cupom)) remember(o.productId);
+          else remove = keepForRetry(item, 'envio da oferta falhou');
+        }
+      }
+    } catch (e) { log('  erro processando', item.url || item.cupom || '', String(e).slice(0, 160)); remove = keepForRetry(item, 'excecao'); }
+
+    if (remove) queue.shift(); // sucesso, duplicata ou desistencia: remove da frente (keepForRetry ja reposicionou se necessario)
+    saveQueue();
+    if (queue.length) await sleep(Math.max(6000, rand(CFG.MIN_DELAY, CFG.MAX_DELAY))); // >=6s respeita o limite de 5s do Wasender
   }
   working = false;
 }
