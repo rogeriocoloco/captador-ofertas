@@ -80,6 +80,17 @@ async function getHtml(url, cookie) {
 
 function pick(html, ...res) { for (const re of res) { const m = html.match(re); if (m) return (m[1] || '').replace(/&amp;/g, '&').trim(); } return ''; }
 
+// valida que a URL e uma imagem real (evita mandar placeholder/quadro preto no WhatsApp)
+async function validImg(url) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return false;
+    if (!/image\//i.test(r.headers.get('content-type') || '')) return false;
+    const len = +(r.headers.get('content-length') || 0) || (await r.arrayBuffer()).byteLength;
+    return len > 2000; // placeholder da Amazon costuma ser um gif de ~43 bytes
+  } catch { return false; }
+}
+
 // ---------- resolvers ----------
 async function resolveAmazon(url) {
   // passo 1: ASIN seguindo o redirect com UA normal (a URL final tem /dp/ASIN mesmo se a pagina vier como captcha)
@@ -90,16 +101,19 @@ async function resolveAmazon(url) {
   } catch (e) { log('  amazon p1', String(e).slice(0, 80)); }
   const asin = pick(canon + '\n' + html1, /\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/, /"asin"\s*:\s*"([A-Z0-9]{10})"/i);
   if (!asin) return null;
-  // passo 2: og:image/title/preco com UA de crawler na URL limpa (Amazon libera as tags pro preview de link)
+  // passo 2: og:image/title/preco com UA de crawler; a Amazon devolve INTERMITENTE, entao tenta ate 3x
   let image = '', title = '', price = '';
-  try {
-    const { html } = await getHtml(`https://www.amazon.com.br/dp/${asin}`);
-    image = pick(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i, /"hiRes"\s*:\s*"(https:[^"]+)"/i, /data-old-hires=["'](https:[^"']+)/i);
-    title = pick(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i).replace(/\s*[:|-]\s*Amazon.*$/i, '');
-    price = pick(html, /class="a-offscreen">\s*(R\$[\s\d.,]+)/i);
-  } catch (e) { log('  amazon p2', String(e).slice(0, 80)); }
-  // fallback de imagem: endpoint publico de imagem por ASIN (cobre boa parte dos produtos quando og falha)
-  if (!image) image = `https://images-na.ssl-images-amazon.com/images/P/${asin}.jpg`;
+  for (let i = 0; i < 3 && !image; i++) {
+    try {
+      const { html } = await getHtml(`https://www.amazon.com.br/dp/${asin}`);
+      if (!title) title = pick(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i).replace(/\s*[:|-]\s*Amazon.*$/i, '');
+      if (!price) price = pick(html, /class="a-offscreen">\s*(R\$[\s\d.,]+)/i);
+      const og = pick(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i, /"hiRes"\s*:\s*"(https:[^"]+)"/i, /data-old-hires=["'](https:[^"']+)/i);
+      if (og && await validImg(og)) image = og;
+    } catch (e) { log('  amazon p2', String(e).slice(0, 80)); }
+  }
+  // fallback: imagem por ASIN, so se for valida (o endpoint devolve gif 43b de placeholder p/ alguns ASIN)
+  if (!image) { const det = `https://images-na.ssl-images-amazon.com/images/P/${asin}.jpg`; if (await validImg(det)) image = det; }
   return { productId: asin, link: `https://www.amazon.com.br/dp/${asin}?tag=${CFG.AMZ_TAG}`, image, title, price, network: 'amazon' };
 }
 
