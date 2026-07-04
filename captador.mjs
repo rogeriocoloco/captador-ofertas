@@ -92,6 +92,20 @@ if (process.env.SOURCE_GROUP_JID_US && process.env.WASENDER_TOKEN_US) {
     driver: 'wasender',
   });
 }
+// 2a fonte US (Amazon, links divulgador). Recebe pela Evolution (numero e membro do grupo) e
+// posta no MESMO destino US (Hot Finds) via Wasender; header proprio (⭐) so pra diferenciar a fonte.
+if (process.env.SOURCE_GROUP_JID_US2 && process.env.WASENDER_TOKEN_US) {
+  ROUTES.push({
+    market: 'US',
+    source: process.env.SOURCE_GROUP_JID_US2,
+    target: process.env.TARGET_GROUP_JID_US2 || process.env.TARGET_GROUP_JID_US || '',
+    token: process.env.WASENDER_TOKEN_US,
+    amzTag: process.env.AMAZON_TAG_US || 'rogeriocoloco-20',
+    ml: false,
+    driver: 'wasender',
+    headers: ['⭐ TOP DEAL', '⭐ HOT PICK', '⭐ DEAL DROP', '⭐ BIG SAVE', '⭐ PRICE DROP'],
+  });
+}
 const routeFor = (jid) => ROUTES.find(r => r.source === jid) || null;
 console.log('rotas:', ROUTES.map(r => `${r.market}[${r.source} -> ${r.target} tag=${r.amzTag} ml=${r.ml} tok=${r.token ? 'ok' : 'FALTA'}]`).join('  |  '));
 
@@ -263,7 +277,7 @@ const HEADERS = ['🔥 ACHADO', '💥 OFERTA', '🍌 PREÇO DE BANANA', '⚡ PRO
 const HEADERS_US = ['🔥 HOT DEAL', '💥 PRICE DROP', '⚡ DEAL ALERT', '🚨 PRICE DROP', '📉 DEAL'];
 function buildText(o, cupom, route) {
   const us = route.market === 'US';
-  const H = us ? HEADERS_US : HEADERS;
+  const H = route.headers || (us ? HEADERS_US : HEADERS); // header proprio da rota (p/ diferenciar fontes), senao o default do mercado
   const L = [`${H[rand(0, H.length)]}${o.title ? ' — ' + o.title : ''}`];
   if (o.price) L.push(`💰 ${o.price}`);
   L.push('', `👉 ${o.link}`);
