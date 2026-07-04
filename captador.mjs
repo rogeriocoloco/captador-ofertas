@@ -72,8 +72,14 @@ function safeRead(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return
 // Cada rota: de qual grupo pegar (source) -> pra qual mandar (target) usando qual token/tag/mercado.
 // BR: Amazon + Mercado Livre. US: so Amazon (amazon.com). O numero que RECEBE e o que ENVIA podem ser
 // sessoes/tokens diferentes do Wasender (ex.: US recebe por um numero e posta por outro).
+// Driver de envio Evolution API (opcional). Se EVO_* setado, a rota BR envia pela Evolution
+// (mesmo numero recebe e manda); senao usa Wasender. US fica sempre no Wasender.
+const EVO = (process.env.EVO_BASE && process.env.EVO_INSTANCE && process.env.EVO_KEY)
+  ? { base: process.env.EVO_BASE.replace(/\/+$/, ''), instance: process.env.EVO_INSTANCE, key: process.env.EVO_KEY }
+  : null;
 const ROUTES = [
-  { market: 'BR', source: CFG.SOURCE, target: CFG.TARGET, token: CFG.TOKEN, amzTag: CFG.AMZ_TAG, ml: true },
+  { market: 'BR', source: CFG.SOURCE, target: CFG.TARGET, token: CFG.TOKEN, amzTag: CFG.AMZ_TAG, ml: true,
+    driver: EVO ? 'evolution' : 'wasender', evo: EVO },
 ];
 if (process.env.SOURCE_GROUP_JID_US && process.env.WASENDER_TOKEN_US) {
   ROUTES.push({
@@ -83,6 +89,7 @@ if (process.env.SOURCE_GROUP_JID_US && process.env.WASENDER_TOKEN_US) {
     token: process.env.WASENDER_TOKEN_US,
     amzTag: process.env.AMAZON_TAG_US || 'rogeriocoloco-20',
     ml: false,
+    driver: 'wasender',
   });
 }
 const routeFor = (jid) => ROUTES.find(r => r.source === jid) || null;
@@ -264,12 +271,24 @@ function buildText(o, cupom, route) {
   return L.join('\n');
 }
 
-// envia usando o token/destino DA ROTA (US recebe por um numero e posta por outro -> token diferente)
+// envia pela ROTA. driver 'evolution' (Evolution API) ou 'wasender' (default).
+// payload = { text, imageUrl? }. Cada rota tem seu destino/credencial (mesmo numero pode receber e mandar).
 async function wasend(route, payload) {
-  const r = await fetchT(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + route.token, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ to: route.target, ...payload }) }, 15000);
-  const t = await r.text();
-  ringPush(txLog, { market: route.market, to: route.target, ok: r.ok, status: r.status, txt: (payload.text || payload.imageUrl || '').slice(0, 90) });
-  return { ok: r.ok, status: r.status, body: t.slice(0, 160) };
+  let r, status = 0, ok = false, body = '';
+  if (route.driver === 'evolution' && route.evo) {
+    const { base, instance, key } = route.evo;
+    const img = payload.imageUrl;
+    const url = base + (img ? '/message/sendMedia/' : '/message/sendText/') + instance;
+    const b = img
+      ? { number: route.target, mediatype: 'image', media: img, caption: payload.text || '' }
+      : { number: route.target, text: payload.text || '' };
+    r = await fetchT(url, { method: 'POST', headers: { apikey: key, 'Content-Type': 'application/json' }, body: JSON.stringify(b) }, 20000);
+  } else {
+    r = await fetchT(SEND_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + route.token, 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ to: route.target, ...payload }) }, 15000);
+  }
+  status = r.status; ok = r.ok; body = (await r.text()).slice(0, 160);
+  ringPush(txLog, { market: route.market, driver: route.driver, to: route.target, ok, status, txt: (payload.text || payload.imageUrl || '').slice(0, 90) });
+  return { ok, status, body };
 }
 
 async function sendOffer(o, cupom, route) {
