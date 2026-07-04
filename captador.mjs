@@ -412,17 +412,18 @@ async function worker() {
     if (!inWindow()) { log(`  fora da janela ${CFG.SEND_START_H}-${CFG.SEND_END_H}h — segurando ${queue.length} na fila`); await sleep(5 * 60 * 1000); continue; }
     const item = queue[0]; // PEEK: so remove da fila (disco) depois de enviar OK -> sobrevive a restart/crash sem perder
     let remove = true;
+    let didSend = false; // so aplica a cadencia longa (anti-burst) quando de fato mandou msg pro WhatsApp; pulo (nao-Amazon/dup/teto) e rapido
     // rota da mensagem (por JID de origem). Legado: itens antigos sem src caem na rota BR (a primeira).
     const route = routeFor(item.src) || ROUTES.find(r => r.market === 'BR') || ROUTES[0];
     try {
       if (!route || !route.token || !route.target) { log('  SEM rota/token/destino -> descarta', item.src || item.url || ''); }
       else if (item.kind === 'status') {
+        didSend = true;
         await sendStatus(item.text, route); // status e informativo: best-effort, sem retry
       } else if (item.kind === 'coupon') {
         const id = 'cupom:' + item.cupom;
         if (sent.has(id)) log('  dup cupom', item.cupom);
-        else if (await sendCoupon(item, route)) remember(id);
-        else remove = keepForRetry(item, 'envio de cupom falhou');
+        else { didSend = true; if (await sendCoupon(item, route)) remember(id); else remove = keepForRetry(item, 'envio de cupom falhou'); }
       } else {
         const o = await resolve(item.url, route);
         if (!o) remove = keepForRetry(item, 'nao resolveu (bloqueio/link morto)');
@@ -430,6 +431,7 @@ async function worker() {
         else if (sent.has(o.productId)) log('  dup, ja enviado', o.productId);
         else if (CFG.DAILY_CAP > 0 && sentToday(route.market) >= CFG.DAILY_CAP) { log(`  TETO diario ${CFG.DAILY_CAP} atingido (${route.market}) -> descarta`, o.productId); }
         else {
+          didSend = true;
           if (item.srcPrice && !o.keepPrice) o.price = item.srcPrice; // preco da origem tem prioridade, salvo quando o resolver ja trouxe preco estruturado (divulgador)
           if (!o.title && item.srcTitle) o.title = item.srcTitle; // titulo da origem se a Amazon nao devolve og:title
           if (await sendOffer(o, item.cupom, route)) { remember(o.productId); bumpSent(route.market); }
@@ -440,7 +442,10 @@ async function worker() {
 
     if (remove) queue.shift(); // sucesso, duplicata ou desistencia: remove da frente (keepForRetry ja reposicionou se necessario)
     saveQueue();
-    if (queue.length) { const d = adaptiveDelayMs(queue.length); log(`  proxima em ${Math.round(d / 1000)}s (fila=${queue.length}, adaptativo)`); await sleep(Math.max(6000, d)); } // espalha a fila pela janela do dia (anti-burst)
+    if (queue.length) {
+      if (didSend) { const d = Math.max(6000, adaptiveDelayMs(queue.length)); log(`  proxima em ${Math.round(d / 1000)}s (fila=${queue.length}, adaptativo)`); await sleep(d); } // espalha os ENVIOS reais pela janela (anti-burst)
+      else await sleep(1500); // pulo (nao-Amazon/dup/teto): so um respiro, nao gasta a cadencia
+    }
   }
   working = false;
 }
