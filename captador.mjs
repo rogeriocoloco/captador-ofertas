@@ -27,8 +27,16 @@ const CFG = {
   COUPON_REPOST: process.env.COUPON_REPOST === '1', // repostar cupons-sem-produto com link proprio (padrao: off)
   ML_COOKIE: process.env.ML_COOKIE || '',
   ML_TAG:    process.env.ML_TAG || '',
-  MIN_DELAY: (+process.env.MIN_DELAY_S || 8) * 1000,    // jitter minimo entre envios (>=6s p/ o limite 1msg/5s)
-  MAX_DELAY: (+process.env.MAX_DELAY_S || 25) * 1000,   // jitter maximo (rapido o bastante p/ nao acumular em rajada)
+  MIN_DELAY: (+process.env.MIN_DELAY_S || 30) * 1000,    // PISO entre envios (anti-burst; nunca manda mais rapido que isso)
+  MAX_DELAY: (+process.env.MAX_DELAY_S || 600) * 1000,   // TETO de espera (fila leve nao segura oferta alem disso)
+  // ---- cadencia adaptativa + janela de horario (anti-ban) ----
+  // delay = tempo_restante_da_janela / tamanho_da_fila, com jitter, preso entre MIN_DELAY e MAX_DELAY.
+  // espalha rajadas ao longo do dia e garante que cabe na janela; fora da janela, segura a fila.
+  SEND_START_H: process.env.SEND_START_H != null ? +process.env.SEND_START_H : 8,   // hora local de inicio
+  SEND_END_H:   process.env.SEND_END_H   != null ? +process.env.SEND_END_H   : 22,  // hora local de fim
+  TZ_OFFSET:    process.env.SEND_TZ_OFFSET != null ? +process.env.SEND_TZ_OFFSET : -3, // BRT = UTC-3
+  JITTER: Math.min(0.9, Math.max(0, (+process.env.SEND_JITTER || 30) / 100)),          // +-30% de aleatoriedade
+  DAILY_CAP: +process.env.DAILY_CAP || 0,  // 0 = sem teto (so avisa); >0 = descarta excesso do dia
   PORT: +process.env.PORT || 3000,
   UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   // UA de crawler p/ scraping: Amazon bloqueia IP de datacenter no browser normal, mas libera og:image/title pro crawler de preview
@@ -99,6 +107,48 @@ const txLog = [];   // ultimos envios feitos pro grupo
 const ringPush = (arr, item) => { arr.push({ t: new Date().toISOString(), ...item }); if (arr.length > 60) arr.shift(); };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const rand = (a, b) => Math.floor(Math.random() * (b - a) + a);
+
+// ---------- janela de horario + cadencia adaptativa (anti-ban) ----------
+// Relogio "local" via offset (o container roda em UTC). Retorna {h, mins, key(dia)}.
+function nowLocal() {
+  const t = new Date(Date.now() + CFG.TZ_OFFSET * 3600 * 1000);
+  return { h: t.getUTCHours(), min: t.getUTCMinutes(), day: t.toISOString().slice(0, 10), t };
+}
+// dentro da janela de envio? (suporta janela que cruza a meia-noite, ex. 20->2)
+function inWindow(l = nowLocal()) {
+  const s = CFG.SEND_START_H, e = CFG.SEND_END_H;
+  if (s === e) return true;                 // 24h
+  return s < e ? (l.h >= s && l.h < e) : (l.h >= s || l.h < e);
+}
+// segundos restantes ate o FIM da janela de hoje
+function secsLeftInWindow(l = nowLocal()) {
+  let endH = CFG.SEND_END_H; if (endH <= CFG.SEND_START_H) endH += 24; // janela que cruza meia-noite
+  const nowSec = l.h * 3600 + l.min * 60;
+  let endSec = endH * 3600;
+  if (l.h < CFG.SEND_START_H && CFG.SEND_END_H <= CFG.SEND_START_H) endSec = CFG.SEND_END_H * 3600; // ja passou meia-noite
+  return Math.max(60, endSec - nowSec);
+}
+// delay adaptativo: espalha a fila pelo tempo restante da janela, com jitter, preso [MIN,MAX]
+function adaptiveDelayMs(qlen) {
+  const base = (secsLeftInWindow() * 1000) / Math.max(1, qlen);
+  const clamped = Math.min(CFG.MAX_DELAY, Math.max(CFG.MIN_DELAY, base));
+  const j = 1 + (Math.random() * 2 - 1) * CFG.JITTER;   // +-JITTER%
+  return Math.max(CFG.MIN_DELAY, Math.round(clamped * j));
+}
+
+// ---------- contador de volume por hora (mede o volume real da fonte p/ dimensionar) ----------
+const VOL_FILE = path.join(DATA, 'volume.json');
+const volume = (() => { try { return fs.existsSync(VOL_FILE) ? JSON.parse(fs.readFileSync(VOL_FILE, 'utf8')) : {}; } catch { return {}; } })();
+function bumpVolume(market, n = 1) {
+  const l = nowLocal(); const hh = String(l.h).padStart(2, '0');
+  volume[l.day] ??= {}; volume[l.day][market] ??= {}; volume[l.day][market][hh] = (volume[l.day][market][hh] || 0) + n;
+  const days = Object.keys(volume).sort(); while (days.length > 14) delete volume[days.shift()]; // guarda 14 dias
+  try { fs.writeFileSync(VOL_FILE, JSON.stringify(volume)); } catch {}
+}
+const volDayTotal = (day, market) => Object.values(volume[day]?.[market] || {}).reduce((a, b) => a + b, 0);
+// contador de ENVIADOS por dia/mercado (p/ o teto diario opcional)
+function bumpSent(market) { const l = nowLocal(); volume[l.day] ??= {}; const k = market + '__sent'; volume[l.day][k] = (volume[l.day][k] || 0) + 1; try { fs.writeFileSync(VOL_FILE, JSON.stringify(volume)); } catch {} }
+const sentToday = (market) => volume[nowLocal().day]?.[market + '__sent'] || 0;
 
 // fetch com timeout (evita conexao travada segurar a fila)
 async function fetchT(url, opts = {}, ms = 8000) {
@@ -326,6 +376,7 @@ function keepForRetry(item, why) {
 async function worker() {
   if (working) return; working = true;
   while (queue.length) {
+    if (!inWindow()) { log(`  fora da janela ${CFG.SEND_START_H}-${CFG.SEND_END_H}h — segurando ${queue.length} na fila`); await sleep(5 * 60 * 1000); continue; }
     const item = queue[0]; // PEEK: so remove da fila (disco) depois de enviar OK -> sobrevive a restart/crash sem perder
     let remove = true;
     // rota da mensagem (por JID de origem). Legado: itens antigos sem src caem na rota BR (a primeira).
@@ -344,10 +395,11 @@ async function worker() {
         if (!o) remove = keepForRetry(item, 'nao resolveu (bloqueio/link morto)');
         else if (!o.link) remove = keepForRetry(item, 'sem link de afiliado (cookie ML?)');
         else if (sent.has(o.productId)) log('  dup, ja enviado', o.productId);
+        else if (CFG.DAILY_CAP > 0 && sentToday(route.market) >= CFG.DAILY_CAP) { log(`  TETO diario ${CFG.DAILY_CAP} atingido (${route.market}) -> descarta`, o.productId); }
         else {
           if (item.srcPrice && !o.keepPrice) o.price = item.srcPrice; // preco da origem tem prioridade, salvo quando o resolver ja trouxe preco estruturado (divulgador)
           if (!o.title && item.srcTitle) o.title = item.srcTitle; // titulo da origem se a Amazon nao devolve og:title
-          if (await sendOffer(o, item.cupom, route)) remember(o.productId);
+          if (await sendOffer(o, item.cupom, route)) { remember(o.productId); bumpSent(route.market); }
           else remove = keepForRetry(item, 'envio da oferta falhou');
         }
       }
@@ -355,7 +407,7 @@ async function worker() {
 
     if (remove) queue.shift(); // sucesso, duplicata ou desistencia: remove da frente (keepForRetry ja reposicionou se necessario)
     saveQueue();
-    if (queue.length) await sleep(Math.max(6000, rand(CFG.MIN_DELAY, CFG.MAX_DELAY))); // >=6s respeita o limite de 5s do Wasender
+    if (queue.length) { const d = adaptiveDelayMs(queue.length); log(`  proxima em ${Math.round(d / 1000)}s (fila=${queue.length}, adaptativo)`); await sleep(Math.max(6000, d)); } // espalha a fila pela janela do dia (anti-burst)
   }
   working = false;
 }
@@ -444,6 +496,7 @@ function handle(body) {
     title = '';
   }
   for (const url of offers) queue.push({ url, cupom, srcPrice: price, srcTitle: title, src: jid });
+  bumpVolume(route.market, offers.length); // mede o volume real da fonte (por hora) p/ dimensionar cadencia
   saveQueue(); worker();
   return { enfileiradas: offers.length };
 }
@@ -471,7 +524,17 @@ http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, ...out }));
     });
   } else if ((req.url || '').startsWith('/status')) {
-    const body = { up: true, uptime_s: Math.round((Date.now() - BOOT) / 1000), fila: queue.length, ja_enviados: sent.size, rotas: ROUTES.map(r => ({ market: r.market, source: r.source, target: r.target })), recebidas: rxLog.slice(-40).reverse(), enviadas: txLog.slice(-40).reverse() };
+    const l = nowLocal();
+    const body = {
+      up: true, uptime_s: Math.round((Date.now() - BOOT) / 1000), fila: queue.length, ja_enviados: sent.size,
+      hora_local: `${String(l.h).padStart(2, '0')}:${String(l.min).padStart(2, '0')} (UTC${CFG.TZ_OFFSET})`,
+      janela: `${CFG.SEND_START_H}h-${CFG.SEND_END_H}h`, dentro_da_janela: inWindow(l),
+      cadencia: { modo: 'adaptativa', piso_s: CFG.MIN_DELAY / 1000, teto_s: CFG.MAX_DELAY / 1000, jitter: CFG.JITTER, proxima_est_s: Math.round(adaptiveDelayMs(Math.max(1, queue.length)) / 1000), teto_diario: CFG.DAILY_CAP || 'sem teto' },
+      enviados_hoje: ROUTES.reduce((a, r) => (a[r.market] = sentToday(r.market), a), {}),
+      volume_por_hora: volume,
+      rotas: ROUTES.map(r => ({ market: r.market, source: r.source, target: r.target })),
+      recebidas: rxLog.slice(-40).reverse(), enviadas: txLog.slice(-40).reverse(),
+    };
     res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body, null, 2));
   } else { log('req', req.method, req.url); res.writeHead(200); res.end('captador up'); }
 }).listen(CFG.PORT, () => {
