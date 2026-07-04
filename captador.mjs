@@ -253,23 +253,33 @@ async function resolveML(url) {
     finalUrl = r.url; html = (await r.text()).replace(/&amp;/g, '&');
   } catch (e) { log('  ML page block', String(e).slice(0, 80)); }
 
-  // produto compartilhado = card marcado como /home/card-featured/element; pega o item_id real (listing do vendedor)
-  let itemId = '';
-  const feat = html.match(/https?:\/\/[^"'\s\\]*?\/p\/MLB\d+[^"'\s\\]*?c_id=\/home\/card-featured\/element/i);
-  if (feat) itemId = (feat[0].match(/item_id[:%]3?A?(MLB\d+)/i) || feat[0].match(/wid=(MLB\d+)/i) || feat[0].match(/\/p\/(MLB\d+)/i) || [, ''])[1];
+  // produto compartilhado = bloco JSON "id":"card-featured"; o item destacado e o 1o polycard.
+  // (ML migrou pra recommendations-landings-fe em 2026; o formato antigo /p/MLB...c_id=card-featured/element sumiu)
+  html = html.replace(/\\u002F/gi, '/');
+  let itemId = '', listing = '', fTitle = '', fPrice = '', fImg = '';
+  const fi = html.indexOf('"id":"card-featured"');
+  if (fi >= 0) {
+    const seg = html.slice(fi, fi + 4000);
+    itemId = (seg.match(/"metadata"\s*:\s*\{\s*"id"\s*:\s*"(MLB\d+)"/i) || seg.match(/"id"\s*:\s*"(MLB\d+)"/i) || [, ''])[1];
+    listing = (seg.match(/"url"\s*:\s*"(produto\.mercadolivre\.com\.br\/MLB-\d+[^"]*)"/i) || [, ''])[1];
+    fTitle = (seg.match(/"text"\s*:\s*"([^"]+)"\s*,\s*"long_title"/i) || [, ''])[1];
+    fPrice = (seg.match(/"current_price"\s*:\s*\{\s*"value"\s*:\s*([\d.]+)/i) || [, ''])[1];
+    const pid = (seg.match(/"pictures"\s*:\s*\[\s*\{\s*"id"\s*:\s*"([^"]+)"/i) || [, ''])[1];
+    if (pid) fImg = `https://http2.mlstatic.com/D_NQ_NP_${pid}-O.webp`;
+  }
   // fallback: primeiro item_id do body, senao MLB da propria URL
   if (!itemId) itemId = (html.match(/pdp_filters=item_id%3A(MLB\d+)/i) || html.match(/item_id[:%]3?A?(MLB\d+)/i) || (finalUrl + url).match(/(MLB-?\d+)/i) || [, ''])[1];
   itemId = (itemId || '').replace('-', '');
 
-  const image = pick(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i);
-  const title = pick(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i, /<title>([^<]+)</i);
-  const price = pick(html, /"price"\s*:\s*"?([\d.,]+)"?/i);
+  const image = fImg || pick(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i);
+  const title = fTitle || pick(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i, /<title>([^<]+)</i);
+  const price = fPrice || pick(html, /"price"\s*:\s*"?([\d.,]+)"?/i);
 
   if (!itemId || !CFG.ML_COOKIE || !CFG.ML_TAG) { log('  ML sem itemId/creds', itemId || '-'); return null; }
   // createLink so aceita o listing do vendedor (produto.mercadolivre.com.br/MLB-<id>); /p/MLB (catalogo) e recusado
-  const link = await mlCreateLink('https://produto.mercadolivre.com.br/' + itemId.replace('MLB', 'MLB-'));
+  const link = await mlCreateLink(listing ? ('https://' + listing) : ('https://produto.mercadolivre.com.br/' + itemId.replace('MLB', 'MLB-')));
   if (!link) return null;
-  return { productId: itemId, link, image, title, price: price ? 'R$ ' + price : '', network: 'ml' };
+  return { productId: itemId, link, image, title, price: price ? ('R$ ' + String(price).replace('.', ',')) : '', network: 'ml' };
 }
 
 // ---------- montar copy (nao copia literal o autor -> anti-espelho) ----------
