@@ -409,6 +409,18 @@ async function resolveDivulgador(url, route) {
 const queue = (() => { try { return fs.existsSync(QUEUE_FILE) ? JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8')) : []; } catch { return []; } })();
 let working = false;
 const seenMsg = new Set(); // dedup por id de mensagem (Wasender manda ~3 eventos por msg)
+
+// ML "fura a fila": e a rede que mais converte (audiencia compra suplemento/saude/casa), entao ML sai primeiro
+// e o teto diario nunca descarta ML por causa de Amazon. Amazon preenche o resto da fila/teto.
+const isMlUrl = (u) => !!u && /meli\.la|mercadoliv|mercadolibre/i.test(u);
+// enfileira com prioridade: ML entra logo APOS o item em processamento (index 0, nunca mexer nele p/ nao
+// corromper o peek/shift do worker) e apos os ML ja priorizados -> mantem ordem FIFO entre os ML.
+function enqueue(item) {
+  if (!isMlUrl(item.url)) { queue.push(item); return; }
+  let i = 1; // pula o index 0 (em voo)
+  while (i < queue.length && isMlUrl(queue[i].url)) i++; // pula o bloco de ML ja na frente
+  queue.splice(i, 0, item); // splice com start>length faz push; com fila vazia insere no 0 (ok, nada em voo)
+}
 // mantem o item pra nova tentativa (falha transitoria: bloqueio/captcha/rede). Move pro fim da fila
 // pra os outros passarem na frente; desiste (e remove) apos MAX_TRIES. Retorna true se deve remover agora.
 const MAX_TRIES = 4;
@@ -554,7 +566,7 @@ function handle(body) {
     price = single && m ? '$' + m[1] : '';
     title = '';
   }
-  for (const url of offers) queue.push({ url, cupom, srcPrice: price, srcTitle: title, src: jid, ts: Date.now() });
+  for (const url of offers) enqueue({ url, cupom, srcPrice: price, srcTitle: title, src: jid, ts: Date.now() });
   bumpVolume(route.market, offers.length); // mede o volume real da fonte (por hora) p/ dimensionar cadencia
   saveQueue(); worker();
   return { enfileiradas: offers.length };
@@ -598,5 +610,10 @@ http.createServer((req, res) => {
   } else { log('req', req.method, req.url); res.writeHead(200); res.end('captador up'); }
 }).listen(CFG.PORT, () => {
   log(`captador on :${CFG.PORT}  source=${CFG.SOURCE}  target=${CFG.TARGET}  tag=${CFG.AMZ_TAG}`);
-  if (queue.length) { log(`retomando fila persistida: ${queue.length} item(ns)`); worker(); } // sobrevive a restart
+  if (queue.length) {
+    // reordena UMA vez no boot: ML pra frente (FIFO preservado), Amazon depois — aplica a prioridade ao backlog ja parado
+    const ml = queue.filter(x => isMlUrl(x.url)), rest = queue.filter(x => !isMlUrl(x.url));
+    if (ml.length && rest.length) { queue.length = 0; queue.push(...ml, ...rest); saveQueue(); log(`fila reordenada no boot: ${ml.length} ML na frente + ${rest.length} demais`); }
+    log(`retomando fila persistida: ${queue.length} item(ns)`); worker();
+  } // sobrevive a restart
 });
