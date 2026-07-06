@@ -135,6 +135,10 @@ function nowLocal() {
   const t = new Date(Date.now() + CFG.TZ_OFFSET * 3600 * 1000);
   return { h: t.getUTCHours(), min: t.getUTCMinutes(), day: t.toISOString().slice(0, 10), t };
 }
+// dia "local" de um timestamp (ms). Usado pra detectar oferta que sobrou de um dia anterior.
+function localDay(ms) { return new Date(ms + CFG.TZ_OFFSET * 3600 * 1000).toISOString().slice(0, 10); }
+// item velho = enfileirado num dia local diferente do de hoje (ou item legado sem ts). Oferta expira -> nao espelhar atrasado.
+function isStaleItem(item) { return !item.ts || localDay(item.ts) !== nowLocal().day; }
 // dentro da janela de envio? (suporta janela que cruza a meia-noite, ex. 20->2)
 function inWindow(l = nowLocal()) {
   const s = CFG.SEND_START_H, e = CFG.SEND_END_H;
@@ -419,6 +423,13 @@ function keepForRetry(item, why) {
 async function worker() {
   if (working) return; working = true;
   while (queue.length) {
+    // descarta oferta velha (sobrou de dia anterior / item legado): preco ja mudou, cupom esgotou -> nao espelhar atrasado
+    if (isStaleItem(queue[0])) {
+      const it = queue[0];
+      log(`  descartando oferta velha (${it.ts ? new Date(it.ts).toISOString().slice(0, 16) : 'sem ts'}):`, (it.url || it.cupom || it.kind || '').toString().slice(0, 50));
+      queue.shift(); saveQueue();
+      continue;
+    }
     if (!inWindow()) { log(`  fora da janela ${CFG.SEND_START_H}-${CFG.SEND_END_H}h — segurando ${queue.length} na fila`); await sleep(5 * 60 * 1000); continue; }
     const item = queue[0]; // PEEK: so remove da fila (disco) depois de enviar OK -> sobrevive a restart/crash sem perder
     let remove = true;
@@ -522,13 +533,13 @@ function handle(body) {
   if (!offers.length) {
     // aviso de status de cupom (esgotado/expirou/acabou) -> reposta pro grupo saber
     if (/cupom/i.test(text) && /esgotad|acabou|acabaram|expirou|encerrad|finaliz|indispon|fora do ar|desativ|cupom\s+off/i.test(text)) {
-      queue.push({ kind: 'status', text: cleanStatus(text), src: jid });
+      queue.push({ kind: 'status', text: cleanStatus(text), src: jid, ts: Date.now() });
       saveQueue(); worker();
       return { enfileiradas: 1, tipo: 'status' };
     }
     if (CFG.COUPON_REPOST && cupom) {
       const resgate = (text.match(/https?:\/\/[^\s]+/i) || [])[0] || '';
-      queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text), resgate, src: jid });
+      queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text), resgate, src: jid, ts: Date.now() });
       saveQueue(); worker();
       return { enfileiradas: 1, tipo: 'cupom' };
     }
@@ -543,7 +554,7 @@ function handle(body) {
     price = single && m ? '$' + m[1] : '';
     title = '';
   }
-  for (const url of offers) queue.push({ url, cupom, srcPrice: price, srcTitle: title, src: jid });
+  for (const url of offers) queue.push({ url, cupom, srcPrice: price, srcTitle: title, src: jid, ts: Date.now() });
   bumpVolume(route.market, offers.length); // mede o volume real da fonte (por hora) p/ dimensionar cadencia
   saveQueue(); worker();
   return { enfileiradas: offers.length };
