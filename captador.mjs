@@ -77,11 +77,16 @@ function safeRead(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return
 const EVO = (process.env.EVO_BASE && process.env.EVO_INSTANCE && process.env.EVO_KEY)
   ? { base: process.env.EVO_BASE.replace(/\/+$/, ''), instance: process.env.EVO_INSTANCE, key: process.env.EVO_KEY }
   : null;
+// instancia Evo propria do US (numero da esposa, migrado do Wasender). Base = mesmo servidor; key = apikey da instancia US.
+const EVO_US = (process.env.EVO_BASE && process.env.EVO_INSTANCE_US && process.env.EVO_KEY_US)
+  ? { base: process.env.EVO_BASE.replace(/\/+$/, ''), instance: process.env.EVO_INSTANCE_US, key: process.env.EVO_KEY_US }
+  : null;
+const usDriver = EVO_US ? 'evolution' : 'wasender'; // US envia pela Evo se EVO_US_* setado; senao Wasender
 const ROUTES = [
   { market: 'BR', source: CFG.SOURCE, target: CFG.TARGET, token: CFG.TOKEN, amzTag: CFG.AMZ_TAG, ml: true,
     driver: EVO ? 'evolution' : 'wasender', evo: EVO },
 ];
-if (process.env.SOURCE_GROUP_JID_US && process.env.WASENDER_TOKEN_US) {
+if (process.env.SOURCE_GROUP_JID_US && (EVO_US || process.env.WASENDER_TOKEN_US)) {
   ROUTES.push({
     market: 'US',
     source: process.env.SOURCE_GROUP_JID_US,
@@ -89,12 +94,12 @@ if (process.env.SOURCE_GROUP_JID_US && process.env.WASENDER_TOKEN_US) {
     token: process.env.WASENDER_TOKEN_US,
     amzTag: process.env.AMAZON_TAG_US || 'rogeriocoloco-20',
     ml: false,
-    driver: 'wasender',
+    driver: usDriver, evo: EVO_US,
   });
 }
 // 2a fonte US (Amazon, links divulgador). Recebe pela Evolution (numero e membro do grupo) e
-// posta no MESMO destino US (Hot Finds) via Wasender; header proprio (⭐) so pra diferenciar a fonte.
-if (process.env.SOURCE_GROUP_JID_US2 && process.env.WASENDER_TOKEN_US) {
+// posta no MESMO destino US (Hot Finds); header proprio (⭐) so pra diferenciar a fonte.
+if (process.env.SOURCE_GROUP_JID_US2 && (EVO_US || process.env.WASENDER_TOKEN_US)) {
   ROUTES.push({
     market: 'US',
     source: process.env.SOURCE_GROUP_JID_US2,
@@ -102,7 +107,7 @@ if (process.env.SOURCE_GROUP_JID_US2 && process.env.WASENDER_TOKEN_US) {
     token: process.env.WASENDER_TOKEN_US,
     amzTag: process.env.AMAZON_TAG_US || 'rogeriocoloco-20',
     ml: false,
-    driver: 'wasender',
+    driver: usDriver, evo: EVO_US,
     headers: ['⭐ TOP DEAL', '⭐ HOT PICK', '⭐ DEAL DROP', '⭐ BIG SAVE', '⭐ PRICE DROP'],
   });
 }
