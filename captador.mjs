@@ -430,15 +430,14 @@ const isMlUrl = (u) => !!u && /meli\.la|mercadoliv|mercadolibre/i.test(u);
 const ML_RATIO = Math.max(1, +process.env.ML_RATIO || 2); // ate N ML por 1 Amazon quando ha as duas na fila
 const mlStreak = {}; // por mercado: quantos ML seguidos ja sairam (reseta ao enviar Amazon) -> garante a vez da Amazon
 function enqueue(market, item) { Q[market].push(item); } // FIFO; o intercalado e decidido no envio (pickIndex)
-// escolhe o proximo item da fila do mercado: status/cupom na frente; senao intercala ML e Amazon (ML_RATIO:1)
+// escolhe o proximo item da fila do mercado: intercala ML e Amazon (ML_RATIO:1). Cupom/status NAO furam a
+// fila (senao um lote deles trava as ofertas) — entram na faixa nao-ML (FIFO), saem intercalados com a Amazon.
 function pickIndex(q, market) {
-  const si = q.findIndex(x => x.kind);              // status/cupom sao informativos/tempo-sensiveis -> na frente
-  if (si >= 0) return si;
-  const haveMl = q.some(x => isMlUrl(x.url)), haveAmz = q.some(x => x.url && !isMlUrl(x.url));
-  if (!haveMl || !haveAmz) return 0;                // so uma rede na fila -> FIFO normal
-  const wantMl = (mlStreak[market] || 0) < ML_RATIO; // ainda no bloco de ML? senao e a vez da Amazon
+  const haveMl = q.some(x => isMlUrl(x.url)), haveAmz = q.some(x => !isMlUrl(x.url)); // nao-ML = Amazon + cupom/status
+  if (!haveMl || !haveAmz) return 0;                // so uma faixa na fila -> FIFO normal
+  const wantMl = (mlStreak[market] || 0) < ML_RATIO; // ainda no bloco de ML? senao e a vez da faixa nao-ML
   const idx = q.findIndex(x => isMlUrl(x.url) === wantMl);
-  return idx >= 0 ? idx : 0;                        // acha o mais antigo (FIFO) da rede desejada
+  return idx >= 0 ? idx : 0;                        // pega o mais antigo (FIFO) da faixa desejada
 }
 // mantem o item pra nova tentativa (falha transitoria). Move pro fim da fila DO MERCADO; desiste apos MAX_TRIES.
 const MAX_TRIES = 4;
