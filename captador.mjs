@@ -591,8 +591,28 @@ if (process.argv.includes('--test')) {
 http.createServer((req, res) => {
   // aceita QUALQUER POST como webhook (robusto se o Wasender for configurado so com o dominio, sem /webhook/captador)
   if (req.method === 'POST') {
+    const url = req.url || '';
     let b = ''; req.on('data', c => b += c);
-    req.on('end', () => {
+    req.on('end', async () => {
+      // ---- ponte /emit-us: emissor n8n da BUSCA USA manda no MESMO formato do Wasender ({to,text,imageUrl}) e
+      // o captador reenvia pela Evo (rota US, hot-finds-us). Assim no n8n muda so a URL, mais nada. ----
+      if (url.startsWith('/emit')) {
+        let r = { ok: false, erro: 'sem rota US com Evo' };
+        try {
+          const p = JSON.parse(b || '{}');
+          const usRoute = ROUTES.find(x => x.market === 'US' && x.evo);
+          const to = p.to || p.number || (usRoute && usRoute.target);
+          const text = p.text || p.message || p.caption || '';
+          const imageUrl = p.imageUrl || p.image || p.media || undefined;
+          if (usRoute && to && (text || imageUrl)) {
+            r = await wasend({ ...usRoute, target: to }, { text, imageUrl });
+            if (r.ok) bumpSent(usRoute.market);
+          } else r = { ok: false, erro: 'faltou rota US/to/conteudo', temRota: !!usRoute };
+        } catch (e) { r = { ok: false, erro: String(e) }; }
+        log('emit-us', JSON.stringify(r).slice(0, 140));
+        res.writeHead(r.ok ? 200 : 502, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r));
+        return;
+      }
       let out, body;
       try { body = JSON.parse(b || '{}'); out = handle(body); } catch (e) { out = { erro: String(e) }; }
       try { const p = parseMessage(body || {}); if (p && p.jid) ringPush(rxLog, { jid: p.jid, market: (routeFor(p.jid) || {}).market || '?', txt: (p.text || '').slice(0, 120), out }); } catch {}
