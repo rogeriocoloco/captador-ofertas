@@ -120,9 +120,19 @@ const DEDUP = path.join(DATA, 'enviados.json');
 const sent = new Set(fs.existsSync(DEDUP) ? JSON.parse(fs.readFileSync(DEDUP, 'utf8')) : []);
 const remember = (id) => { sent.add(id); fs.writeFileSync(DEDUP, JSON.stringify([...sent], null, 0)); };
 
-// ---------- fila persistente (sobrevive a restart -> nao perde oferta em espera) ----------
-const QUEUE_FILE = path.join(DATA, 'fila.json');
-const saveQueue = () => { try { fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 0)); } catch (e) { console.error('saveQueue', e.message); } };
+// ---------- filas persistentes POR MERCADO (BR e US independentes: a enxurrada do BR nao segura o US/mamaede3) ----------
+// Cada mercado tem SUA fila, SEU worker, SUA cadencia e SEU teto -> mamaede3 (US) flui sem competir com o BR.
+// (A busca USA do n8n NAO usa fila: entra por /emit-us e envia direto, entao nada aqui a afeta.)
+const OLD_QUEUE_FILE = path.join(DATA, 'fila.json'); // fila unica do formato antigo -> migrada no boot
+const qFile = (m) => path.join(DATA, `fila_${m}.json`);
+const MARKETS = [...new Set(ROUTES.map(r => r.market))];
+const Q = {}; const working = {};
+for (const m of MARKETS) {
+  Q[m] = (() => { try { return fs.existsSync(qFile(m)) ? JSON.parse(fs.readFileSync(qFile(m), 'utf8')) : []; } catch { return []; } })();
+  working[m] = false;
+}
+const saveQ = (m) => { try { fs.writeFileSync(qFile(m), JSON.stringify(Q[m], null, 0)); } catch (e) { console.error('saveQ', e.message); } };
+const totalFila = () => MARKETS.reduce((a, m) => a + Q[m].length, 0);
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -410,82 +420,82 @@ async function resolveDivulgador(url, route) {
   return { productId: asin || prod.uuid, link, image: prod.image || '', title: prod.title || '', price: prod.price || '', network: 'amazon', keepPrice: true };
 }
 
-// ---------- fila global (respeita 1 msg/5s do Wasender + jitter anti-espelho) ----------
-const queue = (() => { try { return fs.existsSync(QUEUE_FILE) ? JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8')) : []; } catch { return []; } })();
-let working = false;
+// ---------- fila POR MERCADO (Q/working definidos acima). 1 msg/5s + jitter anti-espelho ----------
 const seenMsg = new Set(); // dedup por id de mensagem (Wasender manda ~3 eventos por msg)
 
 // ML "fura a fila": e a rede que mais converte (audiencia compra suplemento/saude/casa), entao ML sai primeiro
-// e o teto diario nunca descarta ML por causa de Amazon. Amazon preenche o resto da fila/teto.
+// e o teto diario nunca descarta ML por causa de Amazon. Amazon preenche o resto. (so o mercado BR tem ML)
 const isMlUrl = (u) => !!u && /meli\.la|mercadoliv|mercadolibre/i.test(u);
-// enfileira com prioridade: ML entra logo APOS o item em processamento (index 0, nunca mexer nele p/ nao
-// corromper o peek/shift do worker) e apos os ML ja priorizados -> mantem ordem FIFO entre os ML.
-function enqueue(item) {
-  if (!isMlUrl(item.url)) { queue.push(item); return; }
+// enfileira com prioridade DENTRO da fila do mercado: ML entra logo APOS o item em processamento (index 0,
+// nunca mexer nele p/ nao corromper o peek/shift do worker) e apos os ML ja priorizados -> FIFO entre os ML.
+function enqueue(market, item) {
+  const q = Q[market];
+  if (!isMlUrl(item.url)) { q.push(item); return; }
   let i = 1; // pula o index 0 (em voo)
-  while (i < queue.length && isMlUrl(queue[i].url)) i++; // pula o bloco de ML ja na frente
-  queue.splice(i, 0, item); // splice com start>length faz push; com fila vazia insere no 0 (ok, nada em voo)
+  while (i < q.length && isMlUrl(q[i].url)) i++; // pula o bloco de ML ja na frente
+  q.splice(i, 0, item); // splice com start>length faz push; com fila vazia insere no 0 (ok, nada em voo)
 }
-// mantem o item pra nova tentativa (falha transitoria: bloqueio/captcha/rede). Move pro fim da fila
-// pra os outros passarem na frente; desiste (e remove) apos MAX_TRIES. Retorna true se deve remover agora.
+// mantem o item pra nova tentativa (falha transitoria). Move pro fim da fila DO MERCADO; desiste apos MAX_TRIES.
 const MAX_TRIES = 4;
-function keepForRetry(item, why) {
+function keepForRetry(q, item, why) {
   item.tries = (item.tries || 0) + 1;
   if (item.tries >= MAX_TRIES) { log(`  DESISTIU apos ${item.tries}x:`, why, item.url || item.cupom || ''); return true; }
   log(`  retry ${item.tries}/${MAX_TRIES - 1}:`, why, item.url || item.cupom || '');
-  if (queue.length > 1) queue.push(queue.shift()); // manda pro fim; se for o unico, fica e re-tenta apos o sleep
+  if (q.length > 1) q.push(q.shift()); // manda pro fim; se for o unico, fica e re-tenta apos o sleep
   return false;
 }
 
-async function worker() {
-  if (working) return; working = true;
-  while (queue.length) {
+// UM worker por mercado: cada fila tem sua cadencia/teto/janela -> a enxurrada do BR nao segura o US (mamaede3).
+async function worker(market) {
+  if (working[market]) return; working[market] = true;
+  const q = Q[market];
+  while (q.length) {
     // descarta oferta velha (sobrou de dia anterior / item legado): preco ja mudou, cupom esgotou -> nao espelhar atrasado
-    if (isStaleItem(queue[0])) {
-      const it = queue[0];
-      log(`  descartando oferta velha (${it.ts ? new Date(it.ts).toISOString().slice(0, 16) : 'sem ts'}):`, (it.url || it.cupom || it.kind || '').toString().slice(0, 50));
-      queue.shift(); saveQueue();
+    if (isStaleItem(q[0])) {
+      const it = q[0];
+      log(`  [${market}] descartando oferta velha (${it.ts ? new Date(it.ts).toISOString().slice(0, 16) : 'sem ts'}):`, (it.url || it.cupom || it.kind || '').toString().slice(0, 50));
+      q.shift(); saveQ(market);
       continue;
     }
-    if (!inWindow()) { log(`  fora da janela ${CFG.SEND_START_H}-${CFG.SEND_END_H}h — segurando ${queue.length} na fila`); await sleep(5 * 60 * 1000); continue; }
-    const item = queue[0]; // PEEK: so remove da fila (disco) depois de enviar OK -> sobrevive a restart/crash sem perder
+    if (!inWindow()) { log(`  [${market}] fora da janela ${CFG.SEND_START_H}-${CFG.SEND_END_H}h — segurando ${q.length} na fila`); await sleep(5 * 60 * 1000); continue; }
+    const item = q[0]; // PEEK: so remove da fila (disco) depois de enviar OK -> sobrevive a restart/crash sem perder
     let remove = true;
-    let didSend = false; // so aplica a cadencia longa (anti-burst) quando de fato mandou msg pro WhatsApp; pulo (nao-Amazon/dup/teto) e rapido
-    // rota da mensagem (por JID de origem). Legado: itens antigos sem src caem na rota BR (a primeira).
-    const route = routeFor(item.src) || ROUTES.find(r => r.market === 'BR') || ROUTES[0];
+    let didSend = false; // so aplica a cadencia longa (anti-burst) quando de fato mandou msg; pulo (nao-Amazon/dup/teto) e rapido
+    // rota da mensagem (por JID de origem). Legado: itens antigos sem src caem na 1a rota do mercado.
+    const route = routeFor(item.src) || ROUTES.find(r => r.market === market) || ROUTES[0];
     try {
-      if (!route || !route.token || !route.target) { log('  SEM rota/token/destino -> descarta', item.src || item.url || ''); }
+      if (!route || !route.token || !route.target) { log(`  [${market}] SEM rota/token/destino -> descarta`, item.src || item.url || ''); }
       else if (item.kind === 'status') {
         didSend = true;
         await sendStatus(item.text, route); // status e informativo: best-effort, sem retry
       } else if (item.kind === 'coupon') {
         const id = 'cupom:' + item.cupom;
         if (sent.has(id)) log('  dup cupom', item.cupom);
-        else { didSend = true; if (await sendCoupon(item, route)) remember(id); else remove = keepForRetry(item, 'envio de cupom falhou'); }
+        else { didSend = true; if (await sendCoupon(item, route)) remember(id); else remove = keepForRetry(q, item, 'envio de cupom falhou'); }
       } else {
         const o = await resolve(item.url, route);
-        if (!o) remove = keepForRetry(item, 'nao resolveu (bloqueio/link morto)');
-        else if (!o.link) remove = keepForRetry(item, 'sem link de afiliado (cookie ML?)');
+        if (!o) remove = keepForRetry(q, item, 'nao resolveu (bloqueio/link morto)');
+        else if (!o.link) remove = keepForRetry(q, item, 'sem link de afiliado (cookie ML?)');
         else if (sent.has(o.productId)) log('  dup, ja enviado', o.productId);
-        else if (CFG.DAILY_CAP > 0 && sentToday(route.market) >= CFG.DAILY_CAP) { log(`  TETO diario ${CFG.DAILY_CAP} atingido (${route.market}) -> descarta`, o.productId); }
+        else if (CFG.DAILY_CAP > 0 && sentToday(route.market) >= CFG.DAILY_CAP) { log(`  [${market}] TETO diario ${CFG.DAILY_CAP} atingido -> descarta`, o.productId); }
         else {
           didSend = true;
           if (item.srcPrice && !o.keepPrice) o.price = item.srcPrice; // preco da origem tem prioridade, salvo quando o resolver ja trouxe preco estruturado (divulgador)
           if (!o.title && item.srcTitle) o.title = item.srcTitle; // titulo da origem se a Amazon nao devolve og:title
           if (await sendOffer(o, item.cupom, route)) { remember(o.productId); bumpSent(route.market); }
-          else remove = keepForRetry(item, 'envio da oferta falhou');
+          else remove = keepForRetry(q, item, 'envio da oferta falhou');
         }
       }
-    } catch (e) { log('  erro processando', item.url || item.cupom || '', String(e).slice(0, 160)); remove = keepForRetry(item, 'excecao'); }
+    } catch (e) { log(`  [${market}] erro processando`, item.url || item.cupom || '', String(e).slice(0, 160)); remove = keepForRetry(q, item, 'excecao'); }
 
-    if (remove) queue.shift(); // sucesso, duplicata ou desistencia: remove da frente (keepForRetry ja reposicionou se necessario)
-    saveQueue();
-    if (queue.length) {
-      if (didSend) { const d = Math.max(6000, adaptiveDelayMs(queue.length)); log(`  proxima em ${Math.round(d / 1000)}s (fila=${queue.length}, adaptativo)`); await sleep(d); } // espalha os ENVIOS reais pela janela (anti-burst)
+    if (remove) q.shift(); // sucesso, duplicata ou desistencia: remove da frente (keepForRetry ja reposicionou se necessario)
+    saveQ(market);
+    if (q.length) {
+      if (didSend) { const d = Math.max(6000, adaptiveDelayMs(q.length)); log(`  [${market}] proxima em ${Math.round(d / 1000)}s (fila=${q.length}, adaptativo)`); await sleep(d); } // espalha os ENVIOS reais pela janela (anti-burst)
       else await sleep(1500); // pulo (nao-Amazon/dup/teto): so um respiro, nao gasta a cadencia
     }
   }
-  working = false;
+  working[market] = false;
 }
 
 // ---------- parsing do webhook Wasender ----------
@@ -550,14 +560,14 @@ function handle(body) {
   if (!offers.length) {
     // aviso de status de cupom (esgotado/expirou/acabou) -> reposta pro grupo saber
     if (/cupom/i.test(text) && /esgotad|acabou|acabaram|expirou|encerrad|finaliz|indispon|fora do ar|desativ|cupom\s+off/i.test(text)) {
-      queue.push({ kind: 'status', text: cleanStatus(text), src: jid, ts: Date.now() });
-      saveQueue(); worker();
+      Q[route.market].push({ kind: 'status', text: cleanStatus(text), src: jid, ts: Date.now() });
+      saveQ(route.market); worker(route.market);
       return { enfileiradas: 1, tipo: 'status' };
     }
     if (CFG.COUPON_REPOST && cupom) {
       const resgate = (text.match(/https?:\/\/[^\s]+/i) || [])[0] || '';
-      queue.push({ kind: 'coupon', cupom, rules: extractCouponRules(text), resgate, src: jid, ts: Date.now() });
-      saveQueue(); worker();
+      Q[route.market].push({ kind: 'coupon', cupom, rules: extractCouponRules(text), resgate, src: jid, ts: Date.now() });
+      saveQ(route.market); worker(route.market);
       return { enfileiradas: 1, tipo: 'cupom' };
     }
     return { skip: 'sem ofertas' };
@@ -571,9 +581,9 @@ function handle(body) {
     price = single && m ? '$' + m[1] : '';
     title = '';
   }
-  for (const url of offers) enqueue({ url, cupom, srcPrice: price, srcTitle: title, src: jid, ts: Date.now() });
+  for (const url of offers) enqueue(route.market, { url, cupom, srcPrice: price, srcTitle: title, src: jid, ts: Date.now() });
   bumpVolume(route.market, offers.length); // mede o volume real da fonte (por hora) p/ dimensionar cadencia
-  saveQueue(); worker();
+  saveQ(route.market); worker(route.market);
   return { enfileiradas: offers.length };
 }
 
@@ -623,10 +633,11 @@ http.createServer((req, res) => {
   } else if ((req.url || '').startsWith('/status')) {
     const l = nowLocal();
     const body = {
-      up: true, uptime_s: Math.round((Date.now() - BOOT) / 1000), fila: queue.length, ja_enviados: sent.size,
+      up: true, uptime_s: Math.round((Date.now() - BOOT) / 1000), fila: totalFila(),
+      filas: MARKETS.reduce((a, m) => (a[m] = Q[m].length, a), {}), ja_enviados: sent.size,
       hora_local: `${String(l.h).padStart(2, '0')}:${String(l.min).padStart(2, '0')} (UTC${CFG.TZ_OFFSET})`,
       janela: `${CFG.SEND_START_H}h-${CFG.SEND_END_H}h`, dentro_da_janela: inWindow(l),
-      cadencia: { modo: 'adaptativa', piso_s: CFG.MIN_DELAY / 1000, teto_s: CFG.MAX_DELAY / 1000, jitter: CFG.JITTER, proxima_est_s: Math.round(adaptiveDelayMs(Math.max(1, queue.length)) / 1000), teto_diario: CFG.DAILY_CAP || 'sem teto' },
+      cadencia: { modo: 'adaptativa (por mercado)', piso_s: CFG.MIN_DELAY / 1000, teto_s: CFG.MAX_DELAY / 1000, jitter: CFG.JITTER, proxima_est_s: MARKETS.reduce((a, m) => (a[m] = Q[m].length ? Math.round(adaptiveDelayMs(Q[m].length) / 1000) : 0, a), {}), teto_diario: CFG.DAILY_CAP || 'sem teto' },
       enviados_hoje: ROUTES.reduce((a, r) => (a[r.market] = sentToday(r.market), a), {}),
       volume_por_hora: volume,
       rotas: ROUTES.map(r => ({ market: r.market, source: r.source, target: r.target })),
@@ -636,10 +647,21 @@ http.createServer((req, res) => {
   } else { log('req', req.method, req.url); res.writeHead(200); res.end('captador up'); }
 }).listen(CFG.PORT, () => {
   log(`captador on :${CFG.PORT}  source=${CFG.SOURCE}  target=${CFG.TARGET}  tag=${CFG.AMZ_TAG}`);
-  if (queue.length) {
-    // reordena UMA vez no boot: ML pra frente (FIFO preservado), Amazon depois — aplica a prioridade ao backlog ja parado
-    const ml = queue.filter(x => isMlUrl(x.url)), rest = queue.filter(x => !isMlUrl(x.url));
-    if (ml.length && rest.length) { queue.length = 0; queue.push(...ml, ...rest); saveQueue(); log(`fila reordenada no boot: ${ml.length} ML na frente + ${rest.length} demais`); }
-    log(`retomando fila persistida: ${queue.length} item(ns)`); worker();
+  // migra fila unica do formato antigo (fila.json) -> filas por mercado, roteando por JID de origem
+  try {
+    if (fs.existsSync(OLD_QUEUE_FILE)) {
+      const old = JSON.parse(fs.readFileSync(OLD_QUEUE_FILE, 'utf8') || '[]');
+      for (const it of old) { const m = (routeFor(it.src) || {}).market || MARKETS[0]; (Q[m] || Q[MARKETS[0]]).push(it); }
+      fs.unlinkSync(OLD_QUEUE_FILE);
+      if (old.length) log(`migrada fila unica antiga: ${old.length} itens -> por mercado`);
+    }
+  } catch (e) { log('migracao fila antiga', e.message); }
+  for (const m of MARKETS) {
+    if (!Q[m].length) continue;
+    // reordena UMA vez no boot: ML pra frente (FIFO preservado), demais depois (so BR tem ML)
+    const ml = Q[m].filter(x => isMlUrl(x.url)), rest = Q[m].filter(x => !isMlUrl(x.url));
+    if (ml.length && rest.length) { Q[m].length = 0; Q[m].push(...ml, ...rest); }
+    saveQ(m);
+    log(`[${m}] retomando fila: ${Q[m].length} item(ns)`); worker(m); // uma fila/worker por mercado, independentes
   } // sobrevive a restart
 });
