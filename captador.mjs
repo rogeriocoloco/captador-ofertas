@@ -603,7 +603,8 @@ http.createServer((req, res) => {
           const usRoute = ROUTES.find(x => x.market === 'US' && x.evo);
           const to = p.to || p.number || (usRoute && usRoute.target);
           const text = p.text || p.message || p.caption || '';
-          const imageUrl = p.imageUrl || p.image || p.media || undefined;
+          const rawImg = p.imageUrl || p.image || p.media || '';
+          const imageUrl = /^https?:\/\//i.test(rawImg) ? rawImg : undefined; // ignora vazio/'undefined' (planilha sem imagem) -> manda so texto
           if (usRoute && to && (text || imageUrl)) {
             r = await wasend({ ...usRoute, target: to }, { text, imageUrl });
             if (r.ok) bumpSent(usRoute.market);
