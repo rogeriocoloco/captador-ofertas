@@ -615,23 +615,29 @@ http.createServer((req, res) => {
     const url = req.url || '';
     let b = ''; req.on('data', c => b += c);
     req.on('end', async () => {
-      // ---- ponte /emit-us: emissor n8n da BUSCA USA manda no MESMO formato do Wasender ({to,text,imageUrl}) e
-      // o captador reenvia pela Evo (rota US, hot-finds-us). Assim no n8n muda so a URL, mais nada. ----
-      if (url.startsWith('/emit')) {
-        let r = { ok: false, erro: 'sem rota US com Evo' };
+      // ---- ponte /emit-us e /emit-br: emissores n8n das BUSCAS (USA e as 3 do BR: Amazon/ML/Shopee) mandam no
+      // MESMO formato do Wasender ({to,text,imageUrl}) e o captador reenvia pela Evo da rota certa. No n8n muda
+      // so a URL do node HTTP, mais nada. NAO passa pela fila/teto do espelho (envio direto, sem retry/dedup
+      // aqui — quem evita reenvio e o proprio n8n, marcando ENVIADO na planilha, igual ja fazia com Wasender).
+      // BR conta num contador PROPRIO (BR_BUSCA) pra nao competir com o teto diario do espelho (aditivo de verdade).
+      if (url.startsWith('/emit-br') || url.startsWith('/emit-us') || url === '/emit') {
+        const isBr = url.startsWith('/emit-br');
+        const marketReq = isBr ? 'BR' : 'US';
+        const counterKey = isBr ? 'BR_BUSCA' : 'US';
+        let r = { ok: false, erro: `sem rota ${marketReq} com Evo` };
         try {
           const p = JSON.parse(b || '{}');
-          const usRoute = ROUTES.find(x => x.market === 'US' && x.evo);
-          const to = p.to || p.number || (usRoute && usRoute.target);
+          const evoRoute = ROUTES.find(x => x.market === marketReq && x.evo);
+          const to = p.to || p.number || (evoRoute && evoRoute.target);
           const text = p.text || p.message || p.caption || '';
           const rawImg = p.imageUrl || p.image || p.media || '';
           const imageUrl = /^https?:\/\//i.test(rawImg) ? rawImg : undefined; // ignora vazio/'undefined' (planilha sem imagem) -> manda so texto
-          if (usRoute && to && (text || imageUrl)) {
-            r = await wasend({ ...usRoute, target: to }, { text, imageUrl });
-            if (r.ok) bumpSent(usRoute.market);
-          } else r = { ok: false, erro: 'faltou rota US/to/conteudo', temRota: !!usRoute };
+          if (evoRoute && to && (text || imageUrl)) {
+            r = await wasend({ ...evoRoute, target: to }, { text, imageUrl });
+            if (r.ok) bumpSent(counterKey);
+          } else r = { ok: false, erro: `faltou rota ${marketReq}/to/conteudo`, temRota: !!evoRoute };
         } catch (e) { r = { ok: false, erro: String(e) }; }
-        log('emit-us', JSON.stringify(r).slice(0, 140));
+        log(isBr ? 'emit-br' : 'emit-us', JSON.stringify(r).slice(0, 140));
         res.writeHead(r.ok ? 200 : 502, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r));
         return;
       }
@@ -649,7 +655,7 @@ http.createServer((req, res) => {
       hora_local: `${String(l.h).padStart(2, '0')}:${String(l.min).padStart(2, '0')} (UTC${CFG.TZ_OFFSET})`,
       janela: `${CFG.SEND_START_H}h-${CFG.SEND_END_H}h`, dentro_da_janela: inWindow(l),
       cadencia: { modo: 'adaptativa (por mercado)', piso_s: CFG.MIN_DELAY / 1000, teto_s: CFG.MAX_DELAY / 1000, jitter: CFG.JITTER, proxima_est_s: MARKETS.reduce((a, m) => (a[m] = Q[m].length ? Math.round(adaptiveDelayMs(Q[m].length) / 1000) : 0, a), {}), teto_diario: CFG.DAILY_CAP || 'sem teto', mescla_ml_amz: `${ML_RATIO}:1` },
-      enviados_hoje: ROUTES.reduce((a, r) => (a[r.market] = sentToday(r.market), a), {}),
+      enviados_hoje: { ...ROUTES.reduce((a, r) => (a[r.market] = sentToday(r.market), a), {}), BR_BUSCA: sentToday('BR_BUSCA') }, // BR_BUSCA = envios via /emit-br (buscas Amazon/ML/Shopee), fora do teto do espelho
       volume_por_hora: volume,
       rotas: ROUTES.map(r => ({ market: r.market, source: r.source, target: r.target })),
       recebidas: rxLog.slice(-40).reverse(), enviadas: txLog.slice(-40).reverse(),
