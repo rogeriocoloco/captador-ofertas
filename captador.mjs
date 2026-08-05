@@ -336,11 +336,47 @@ async function wasend(route, payload) {
   return { ok, status, body };
 }
 
+// --- Keepa Caseiro: grava o preco de TODA oferta enviada (Amazon e ML) -------------
+// Por que aqui: o captador e o gargalo por onde passa tudo (escuta do concorrente E
+// os emissores do n8n via /emit-*). Gravando no envio, o historico se forma sozinho
+// a partir do volume que ja existe (~250 ofertas/dia) — sem scraper novo e sem custo.
+// Serve pra depois responder "esse desconto e real ou preco de-por maquiado?", que e
+// a doenca cronica do ML. Fire-and-forget: NUNCA pode derrubar o envio.
+const KEEPA_URL = process.env.KEEPA_URL || '';
+const KEEPA_TOKEN = process.env.KEEPA_TOKEN || '';
+
+function parsePrice(p) {
+  if (typeof p === 'number') return Number.isFinite(p) ? p : null;
+  if (!p) return null;
+  // 'R$ 1.234,56' -> 1234.56 | '$1,234.56' -> 1234.56
+  const s = String(p).replace(/[^\d.,]/g, '');
+  const n = s.includes(',') ? Number(s.replace(/\./g, '').replace(',', '.')) : Number(s);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function keepaIngest(o, route) {
+  if (!KEEPA_URL || !o?.productId) return;
+  const price = parsePrice(o.price);
+  if (price === null) return; // sem preco nao ha serie temporal
+  // marketplace: separa ML de Amazon e BR de US -> baseline nunca mistura mercado
+  const marketplace = o.network === 'ml' ? 'ML' : (route.market === 'US' ? 'US' : 'BR');
+  const body = JSON.stringify({ products: [{
+    asin: String(o.productId), marketplace, price,
+    currency: marketplace === 'US' ? 'USD' : 'BRL',
+    title: o.title || '', image: o.image || '', link: o.link || '', source: 'captador',
+  }] });
+  fetchT(`${KEEPA_URL.replace(/\/$/, '')}/ingest`, {
+    method: 'POST', body,
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + KEEPA_TOKEN },
+  }, 4000).catch((e) => log('  keepa ingest falhou (ignorado)', String(e).slice(0, 60)));
+}
+
 async function sendOffer(o, cupom, route) {
   const payload = { text: buildText(o, cupom, route) };
   if (o.image) payload.imageUrl = o.image;
   const r = await wasend(route, payload);
   log(`  send ${route.market}`, r.status, r.body);
+  if (r.ok) keepaIngest(o, route); // so grava o que realmente foi ao grupo
   return r.ok;
 }
 
