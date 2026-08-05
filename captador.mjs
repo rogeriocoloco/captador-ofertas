@@ -83,7 +83,9 @@ const EVO_US = (process.env.EVO_BASE && process.env.EVO_INSTANCE_US && process.e
   : null;
 const usDriver = EVO_US ? 'evolution' : 'wasender'; // US envia pela Evo se EVO_US_* setado; senao Wasender
 const ROUTES = [
+  // amz: false -> Amazon BR desligada 04/08/2026 (conta de afiliado encerrada). Religar: AMAZON_BR_ON=1
   { market: 'BR', source: CFG.SOURCE, target: CFG.TARGET, token: CFG.TOKEN, amzTag: CFG.AMZ_TAG, ml: true,
+    amz: process.env.AMAZON_BR_ON === '1',
     driver: EVO ? 'evolution' : 'wasender', evo: EVO },
 ];
 if (process.env.SOURCE_GROUP_JID_US && (EVO_US || process.env.WASENDER_TOKEN_US)) {
@@ -392,8 +394,12 @@ async function sendStatus(text, route) {
 }
 
 async function resolve(url, route) {
-  if (/divulgadorinteligente\.com/i.test(url)) return resolveDivulgador(url, route);
-  if (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(url)) return resolveAmazon(url, route);
+  // Amazon BR desligada em 04/08/2026: conta encerrada pela regra das 3 vendas/180d (5o ciclo).
+  // Link Amazon no BR nao credita comissao -> nao ocupa fila nem polui o grupo. ML segue normal.
+  // Rota US nao e afetada (amz fica undefined la, so BR seta false).
+  const amzOff = route.amz === false;
+  if (/divulgadorinteligente\.com/i.test(url)) return amzOff ? null : resolveDivulgador(url, route);
+  if (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(url)) return amzOff ? null : resolveAmazon(url, route);
   if (route.ml && /mercadoliv|mercadolibre|meli\.la|\/sec\//i.test(url)) return resolveML(url);
   return null;
 }
