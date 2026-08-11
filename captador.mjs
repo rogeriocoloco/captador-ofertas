@@ -191,6 +191,11 @@ const volDayTotal = (day, market) => Object.values(volume[day]?.[market] || {}).
 // contador de ENVIADOS por dia/mercado (p/ o teto diario opcional)
 function bumpSent(market) { const l = nowLocal(); volume[l.day] ??= {}; const k = market + '__sent'; volume[l.day][k] = (volume[l.day][k] || 0) + 1; try { fs.writeFileSync(VOL_FILE, JSON.stringify(volume)); } catch {} }
 const sentToday = (market) => volume[nowLocal().day]?.[market + '__sent'] || 0;
+// Teto diario POR MERCADO: DAILY_CAP_<MERCADO> sobrepoe o DAILY_CAP global.
+// Motivo (11/08/2026): grupo US tem 92 membros e recebia ~200 msg/dia -> 16 cliques
+// em 30 dias, 0 venda. Volume alto em audiencia pequena satura e todo mundo silencia.
+// Ex.: DAILY_CAP=300 (BR) + DAILY_CAP_US=10.
+const capFor = (market) => +process.env['DAILY_CAP_' + market] || CFG.DAILY_CAP;
 
 // fetch com timeout (evita conexao travada segurar a fila)
 async function fetchT(url, opts = {}, ms = 8000) {
@@ -526,7 +531,7 @@ async function worker(market) {
         if (!o) remove = keepForRetry(q, idx, 'nao resolveu (bloqueio/link morto)');
         else if (!o.link) remove = keepForRetry(q, idx, 'sem link de afiliado (cookie ML?)');
         else if (sent.has(o.productId)) log('  dup, ja enviado', o.productId);
-        else if (CFG.DAILY_CAP > 0 && sentToday(route.market) >= CFG.DAILY_CAP) { log(`  [${market}] TETO diario ${CFG.DAILY_CAP} atingido -> descarta`, o.productId); }
+        else if (capFor(route.market) > 0 && sentToday(route.market) >= capFor(route.market)) { log(`  [${market}] TETO diario ${capFor(route.market)} atingido -> descarta`, o.productId); }
         else {
           didSend = true;
           if (item.srcPrice && !o.keepPrice) o.price = item.srcPrice; // preco da origem tem prioridade, salvo quando o resolver ja trouxe preco estruturado (divulgador)
@@ -696,7 +701,7 @@ http.createServer((req, res) => {
       filas: MARKETS.reduce((a, m) => (a[m] = Q[m].length, a), {}), ja_enviados: sent.size,
       hora_local: `${String(l.h).padStart(2, '0')}:${String(l.min).padStart(2, '0')} (UTC${CFG.TZ_OFFSET})`,
       janela: `${CFG.SEND_START_H}h-${CFG.SEND_END_H}h`, dentro_da_janela: inWindow(l),
-      cadencia: { modo: 'adaptativa (por mercado)', piso_s: CFG.MIN_DELAY / 1000, teto_s: CFG.MAX_DELAY / 1000, jitter: CFG.JITTER, proxima_est_s: MARKETS.reduce((a, m) => (a[m] = Q[m].length ? Math.round(adaptiveDelayMs(Q[m].length) / 1000) : 0, a), {}), teto_diario: CFG.DAILY_CAP || 'sem teto', mescla_ml_amz: `${ML_RATIO}:1` },
+      cadencia: { modo: 'adaptativa (por mercado)', piso_s: CFG.MIN_DELAY / 1000, teto_s: CFG.MAX_DELAY / 1000, jitter: CFG.JITTER, proxima_est_s: MARKETS.reduce((a, m) => (a[m] = Q[m].length ? Math.round(adaptiveDelayMs(Q[m].length) / 1000) : 0, a), {}), teto_diario: CFG.DAILY_CAP || 'sem teto', teto_por_mercado: MARKETS.reduce((a, m) => (a[m] = capFor(m) || 'sem teto', a), {}), mescla_ml_amz: `${ML_RATIO}:1` },
       enviados_hoje: { ...ROUTES.reduce((a, r) => (a[r.market] = sentToday(r.market), a), {}), BR_BUSCA: sentToday('BR_BUSCA') }, // BR_BUSCA = envios via /emit-br (buscas Amazon/ML/Shopee), fora do teto do espelho
       volume_por_hora: volume,
       rotas: ROUTES.map(r => ({ market: r.market, source: r.source, target: r.target })),
