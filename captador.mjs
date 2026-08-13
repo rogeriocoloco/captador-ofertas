@@ -710,7 +710,9 @@ http.createServer((req, res) => {
       filas: MARKETS.reduce((a, m) => (a[m] = Q[m].length, a), {}), ja_enviados: sent.size,
       hora_local: `${String(l.h).padStart(2, '0')}:${String(l.min).padStart(2, '0')} (UTC${CFG.TZ_OFFSET})`,
       janela: `${CFG.SEND_START_H}h-${CFG.SEND_END_H}h`, dentro_da_janela: inWindow(l),
-      cadencia: { modo: 'adaptativa (por mercado)', piso_s: CFG.MIN_DELAY / 1000, teto_s: CFG.MAX_DELAY / 1000, jitter: CFG.JITTER, proxima_est_s: MARKETS.reduce((a, m) => (a[m] = Q[m].length ? Math.round(adaptiveDelayMs(Q[m].length) / 1000) : 0, a), {}), teto_diario: CFG.DAILY_CAP || 'sem teto', teto_por_mercado: MARKETS.reduce((a, m) => (a[m] = capFor(m) || 'sem teto', a), {}), mescla_ml_amz: `${ML_RATIO}:1` },
+      cadencia: { modo: 'adaptativa (por mercado)', piso_s: CFG.MIN_DELAY / 1000, teto_s: CFG.MAX_DELAY / 1000, jitter: CFG.JITTER, proxima_est_s: MARKETS.reduce((a, m) => (a[m] = Q[m].length ? Math.round(adaptiveDelayMs(Q[m].length) / 1000) : 0, a), {}), teto_diario: CFG.DAILY_CAP || 'sem teto', // NAO usar `capFor(m) || 'sem teto'`: com teto 0 (mercado desligado) o 0 e falsy e
+// o painel mostrava "sem teto" — o oposto da verdade. Teto 0 tem que aparecer como 0.
+teto_por_mercado: MARKETS.reduce((a, m) => { const c = capFor(m); a[m] = (c === Infinity ? 'sem teto' : c); return a; }, {}), mescla_ml_amz: `${ML_RATIO}:1` },
       enviados_hoje: { ...ROUTES.reduce((a, r) => (a[r.market] = sentToday(r.market), a), {}), BR_BUSCA: sentToday('BR_BUSCA') }, // BR_BUSCA = envios via /emit-br (buscas Amazon/ML/Shopee), fora do teto do espelho
       volume_por_hora: volume,
       rotas: ROUTES.map(r => ({ market: r.market, source: r.source, target: r.target })),
