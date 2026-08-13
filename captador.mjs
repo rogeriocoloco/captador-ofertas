@@ -194,8 +194,17 @@ const sentToday = (market) => volume[nowLocal().day]?.[market + '__sent'] || 0;
 // Teto diario POR MERCADO: DAILY_CAP_<MERCADO> sobrepoe o DAILY_CAP global.
 // Motivo (11/08/2026): grupo US tem 92 membros e recebia ~200 msg/dia -> 16 cliques
 // em 30 dias, 0 venda. Volume alto em audiencia pequena satura e todo mundo silencia.
-// Ex.: DAILY_CAP=300 (BR) + DAILY_CAP_US=10.
-const capFor = (market) => +process.env['DAILY_CAP_' + market] || CFG.DAILY_CAP;
+// Ex.: DAILY_CAP=300 (BR) + DAILY_CAP_US=0 (espelho desligado no US).
+// ATENCAO a semantica, que difere de proposito entre os dois:
+//   DAILY_CAP_<MERCADO> explicito -> vale o numero, e 0 BLOQUEIA TUDO nesse mercado.
+//   DAILY_CAP global                -> 0 significa SEM TETO (comportamento historico).
+// A versao anterior usava `|| CFG.DAILY_CAP`, entao DAILY_CAP_US=0 (falsy) caia no
+// global de 300 — o oposto do pretendido. Por isso o teste explicito de string vazia.
+const capFor = (market) => {
+  const raw = process.env['DAILY_CAP_' + market];
+  if (raw != null && String(raw).trim() !== '') return Math.max(0, +raw || 0);
+  return CFG.DAILY_CAP > 0 ? CFG.DAILY_CAP : Infinity;
+};
 
 // fetch com timeout (evita conexao travada segurar a fila)
 async function fetchT(url, opts = {}, ms = 8000) {
@@ -531,7 +540,7 @@ async function worker(market) {
         if (!o) remove = keepForRetry(q, idx, 'nao resolveu (bloqueio/link morto)');
         else if (!o.link) remove = keepForRetry(q, idx, 'sem link de afiliado (cookie ML?)');
         else if (sent.has(o.productId)) log('  dup, ja enviado', o.productId);
-        else if (capFor(route.market) > 0 && sentToday(route.market) >= capFor(route.market)) { log(`  [${market}] TETO diario ${capFor(route.market)} atingido -> descarta`, o.productId); }
+        else if (sentToday(route.market) >= capFor(route.market)) { log(`  [${market}] TETO diario ${capFor(route.market)} atingido -> descarta`, o.productId); }
         else {
           didSend = true;
           if (item.srcPrice && !o.keepPrice) o.price = item.srcPrice; // preco da origem tem prioridade, salvo quando o resolver ja trouxe preco estruturado (divulgador)
