@@ -91,11 +91,15 @@ const ROUTES = [
 // 2a fonte BR (17/08/2026 — "Manhub Ferramentas", 876 membros). Mesmo formato do TA BUGADO:
 // link meli.la no texto. Recebe e posta pela MESMA instancia Evo do BR, cai na MESMA fila BR
 // (a cadencia adaptativa acelera sozinha quando a fila cresce). Header proprio so pra
-// diferenciar a fonte no grupo. Desligar = tirar SOURCE_GROUP_JID_BR2 do env.
-if (process.env.SOURCE_GROUP_JID_BR2 && EVO) {
+// diferenciar a fonte no grupo.
+// JID no default (como o TA BUGADO na linha 24) porque env adicionada fora do painel
+// se perde no proximo deploy. Desligar = SOURCE_GROUP_JID_BR2= (vazio) no painel:
+// `??` mantem o default so quando a env NAO existe; string vazia e falsy e cai fora do if.
+const SOURCE_BR2 = process.env.SOURCE_GROUP_JID_BR2 ?? '120363409254032608@g.us'; // Manhub Ferramentas
+if (SOURCE_BR2 && EVO) {
   ROUTES.push({
     market: 'BR',
-    source: process.env.SOURCE_GROUP_JID_BR2,
+    source: SOURCE_BR2,
     target: process.env.TARGET_GROUP_JID_BR2 || CFG.TARGET,
     token: CFG.TOKEN,
     amzTag: CFG.AMZ_TAG,
