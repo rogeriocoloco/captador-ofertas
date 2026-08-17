@@ -601,8 +601,10 @@ function extractOffers(text) {
   const urls = [...new Set((text.match(/https?:\/\/[^\s)]+/gi) || []))];
   const offers = urls.filter(u => /amzn\.to|amazon\.|\.amazon\/|a\.co\/|mercadoliv|mercadolibre|meli\.la|\/sec\/|divulgadorinteligente\.com/i.test(u));
   // exige ":" (formato real "CUPOM: CODIGO"); fallback sem ":" ignora "CUPOM AMAZON/MERCADO" (titulos)
-  const cupom = (text.match(/cupom\s*[:\-]\s*([A-Z0-9]{4,})/i)
-              || text.match(/cupom\s+(?!amazon|amzn|mercado|prime)([A-Z0-9]{4,})/i)
+  // 17/08/2026: a fonte Manhub escreve "Use o Cupom: *CODIGO*" — o negrito do WhatsApp
+  // ficava entre os dois-pontos e o codigo, e o cupom nao era capturado.
+  const cupom = (text.match(/cupom\s*[:\-]\s*[*_"'`]*\s*([A-Z0-9]{4,})/i)
+              || text.match(/cupom\s+[*_"'`]*(?!amazon|amzn|mercado|prime)([A-Z0-9]{4,})/i)
               || [, ''])[1];
   const srcPrice = extractPricePhrase(text);
   return { offers, cupom, srcPrice, srcTitle: extractTitle(text) };
@@ -624,8 +626,12 @@ function extractTitle(text) {
 
 // bloco de preco da origem completo (ex.: "R$1924,00 PAGANDO VIA PIX OU R$2.299,00 EM 10X") — preserva PIX + parcelado
 function extractPricePhrase(text) {
-  const m = (text || '').match(/R\$[\s\S]*?(?=\s*(?:👉|USAR\s*CUPOM|CUPOM\b|C[ÓO]DIGO|RESGATE|https?:\/\/|$))/i);
-  return m ? m[0].replace(/\s+/g, ' ').trim().slice(0, 120) : '';
+  // o lookahead corta antes do cupom; sem "USE O CUPOM" na lista, "Use o" sobrava
+  // pendurado no fim da frase ("...R$ 220,42 🎟️ Use o"). Visto no grupo em 17/08/2026.
+  const m = (text || '').match(/R\$[\s\S]*?(?=\s*(?:👉|USE\s+O?\s*CUPOM|USAR\s*CUPOM|CUPOM\b|C[ÓO]DIGO|RESGATE|https?:\/\/|$))/i);
+  return m ? m[0].replace(/\s+/g, ' ').trim()
+              .replace(/[\s\-–—:;,.*_🎟️🎟🧧✅❌]+$/u, '')   // apara emoji/pontuacao solta no fim
+              .slice(0, 120) : '';
 }
 
 // regras do cupom (ex.: "10% OFF acima de R$300", "Limitado a R$100"), sem URLs/lixo da origem
