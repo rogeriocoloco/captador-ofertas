@@ -88,6 +88,23 @@ const ROUTES = [
     amz: process.env.AMAZON_BR_ON === '1',
     driver: EVO ? 'evolution' : 'wasender', evo: EVO },
 ];
+// 2a fonte BR (17/08/2026 — "Manhub Ferramentas", 876 membros). Mesmo formato do TA BUGADO:
+// link meli.la no texto. Recebe e posta pela MESMA instancia Evo do BR, cai na MESMA fila BR
+// (a cadencia adaptativa acelera sozinha quando a fila cresce). Header proprio so pra
+// diferenciar a fonte no grupo. Desligar = tirar SOURCE_GROUP_JID_BR2 do env.
+if (process.env.SOURCE_GROUP_JID_BR2 && EVO) {
+  ROUTES.push({
+    market: 'BR',
+    source: process.env.SOURCE_GROUP_JID_BR2,
+    target: process.env.TARGET_GROUP_JID_BR2 || CFG.TARGET,
+    token: CFG.TOKEN,
+    amzTag: CFG.AMZ_TAG,
+    ml: true,
+    amz: process.env.AMAZON_BR_ON === '1',
+    driver: 'evolution', evo: EVO,
+    headers: ['🔧 ACHADO DA OFICINA', '🔧 FERRAMENTA EM OFERTA', '🔧 PREÇO DE FERRAMENTA', '🔧 CAIU O PREÇO', '🔧 OFERTA MÃO NA MASSA'],
+  });
+}
 if (process.env.SOURCE_GROUP_JID_US && (EVO_US || process.env.WASENDER_TOKEN_US)) {
   ROUTES.push({
     market: 'US',
