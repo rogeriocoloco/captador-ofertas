@@ -529,10 +529,31 @@ function keepForRetry(q, idx, why) {
 }
 
 // UM worker por mercado: cada fila tem sua cadencia/teto/janela -> a enxurrada do BR nao segura o US (mamaede3).
+// ---------- pausa do espelho (12/10/2026) ----------
+// As duas escutas BR pararam de postar: o coletor proprio (ml_coletor_api + fila)
+// passou a entregar com PROVA de preco (historico Keepa / spread entre vendedores)
+// e reconferencia no instante do envio, enquanto o espelho republica preco e cupom
+// de terceiro sem verificar nada. Medido em 24h: de 201 itens capturados, 65 foram
+// enviados, 48 eram Amazon (que nao credita mais) e 87 repetidos.
+//
+// ⚠️ A ponte /emit-br NAO para: e ela que publica o ML novo e a Shopee. Por isso a
+// pausa age no `handle` (entrada do webhook) e no `worker` (fila), nunca nas ROUTES —
+// remover a rota BR derrubaria o `/emit-br` junto, que usa ROUTES para achar a Evo.
+//
+// Religar: apagar /data/espelho_off (vale na hora, sem deploy) ou ESPELHO_OFF=0.
+const ESPELHO_FLAG = '/data/espelho_off';
+function espelhoOff() {
+  if (process.env.ESPELHO_OFF === '1') return true;
+  if (process.env.ESPELHO_OFF === '0') return false;   // env vence o arquivo
+  try { return fs.existsSync(ESPELHO_FLAG); } catch { return false; }
+}
+
 async function worker(market) {
   if (working[market]) return; working[market] = true;
   const q = Q[market];
   while (q.length) {
+    // pausa checada DENTRO do laco: religar nao espera restart
+    if (espelhoOff()) { log(`  [${market}] espelho pausado — segurando ${q.length} na fila`); await sleep(5 * 60 * 1000); continue; }
     const idx = pickIndex(q, market); // intercala ML/Amazon (ou status/cupom na frente) em vez de FIFO puro
     // descarta oferta velha (sobrou de dia anterior / item legado): preco ja mudou, cupom esgotou -> nao espelhar atrasado
     if (isStaleItem(q[idx])) {
@@ -647,10 +668,19 @@ function handle(body) {
   if (fromMe) return { skip: 'fromMe' };
   const route = routeFor(jid); // roteia pela ORIGEM: BR (Amazon+ML) ou US (so Amazon)
   if (!route) return { skip: `grupo nao mapeado (${jid})` };
+  if (espelhoOff()) return { skip: 'espelho pausado' };
   // o Wasender dispara ~3 eventos por mensagem (upsert + received + group.received) -> processa so 1x
   if (msgId && seenMsg.has(msgId)) return { skip: 'evento duplicado' };
   if (msgId) { seenMsg.add(msgId); if (seenMsg.size > 3000) seenMsg.clear(); }
-  const { offers, cupom, srcPrice, srcTitle } = extractOffers(text);
+  const { offers: capturadas, cupom, srcPrice, srcTitle } = extractOffers(text);
+  // ⚠️ Link Amazon nao entra na fila quando a rota esta com `amz: false`. Antes
+  // entrava, e so morria depois de 4 tentativas de resolver: 48 itens em 24h, 192
+  // requisicoes jogadas fora, ocupando vaga na fila que atrasa oferta de ML boa.
+  // A conta de afiliado da Amazon nao foi aprovada (12/10/2026) — nao credita nada.
+  const offers = route.amz === false
+    ? capturadas.filter((u) => !/amzn\.to|amazon\.|\.amazon\/|a\.co\/|divulgadorinteligente\.com/i.test(u))
+    : capturadas;
+  if (offers.length !== capturadas.length) log(`  ${capturadas.length - offers.length} link(s) Amazon ignorado(s) na entrada (conta nao aprovada)`);
   if (!offers.length) {
     // aviso de status de cupom (esgotado/expirou/acabou) -> reposta pro grupo saber
     if (/cupom/i.test(text) && /esgotad|acabou|acabaram|expirou|encerrad|finaliz|indispon|fora do ar|desativ|cupom\s+off/i.test(text)) {
@@ -660,6 +690,10 @@ function handle(body) {
     }
     if (CFG.COUPON_REPOST && cupom) {
       const resgate = (text.match(/https?:\/\/[^\s]+/i) || [])[0] || '';
+      // cupom da Amazon para junto: o resgate cai numa loja onde a conta de
+      // afiliado nao foi aprovada — o clique sai de graca para a gente
+      if (route.amz === false && (/amzn\.to|amazon\.|\.amazon\/|a\.co\//i.test(resgate) || /\bamazon\b/i.test(text)))
+        return { skip: 'cupom da Amazon ignorado (conta nao aprovada)' };
       Q[route.market].push({ kind: 'coupon', cupom, rules: extractCouponRules(text), resgate, src: jid, ts: Date.now() });
       saveQ(route.market); worker(route.market);
       return { enfileiradas: 1, tipo: 'cupom' };
